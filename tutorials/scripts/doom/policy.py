@@ -1,23 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Policies for the Doom reflex demo, plus direct prompt-id assembly.
+"""Policies for the Doom demo, plus direct prompt-id assembly.
 
-Every policy answers ``decide(obs, adapter) -> Decision`` and
-``route(instruction) -> Route``, so rollouts, the latency bench and the live
-server can use any of them:
+Every policy answers ``decide(obs, adapter, history) -> Decision``,
+``decide_many(obs, adapters, history)`` (several adapters on one state, one
+engine step) and ``route(instruction) -> Route``, so rollouts, the latency bench
+and the live server can use any of them:
 
-* :class:`ExpertPolicy`: the scripted teacher plus a keyword router. Needs no
-  model, so the whole demo runs on a laptop.
+* :class:`ExpertPolicy`: the scripted player, its weapon planner, a rule-based
+  danger estimate and a keyword router. Needs no model, so the whole demo runs
+  on a laptop.
 * :class:`VLLMPolicy`: the composed Granite Switch checkpoint served in-process
-  by vLLM. One engine step per decision: prefill the fresh state tokens and
-  emit one action token.
+  by vLLM. One engine step per tic prefills the fresh tokens and emits one
+  token per adapter asked.
 
-``decide`` takes the full :class:`~doom_env.Observation` because the expert
-reads privileged fields. Model policies read ``obs.text`` only.
+The game prompt, identical for every game adapter up to its query suffix::
 
-Prompt ids are assembled directly each tick: a pre-tokenized prefix, the
-tokenized state, and a pre-tokenized per-adapter suffix. This skips Jinja
-rendering. ``python policy.py --check-template <model_dir>`` confirms the ids
-are identical to ``apply_chat_template(adapter_name=...)``.
+    <|start_of_role|>system<|end_of_role|>{system}<|end_of_text|>
+    <|start_of_role|>user<|end_of_role|>{history}{pad}now t14.2 | {state}{pad}<|end_of_text|>
+    <|adapter|>assistant<|end_of_role|>            -> one output token
+
+``{history}`` is :class:`history.History`: append-only 5 Hz entries, so the
+engine's prefix cache holds it from one tic to the next. ``{pad}`` is newlines
+up to the next KV block boundary (``BLOCK`` tokens). The first pad changes only
+when the history grows (every 0.2 s); the second makes the state end on a block
+boundary. Together they leave only the adapter suffix as per-adapter work when
+several adapters read the same state in one step.
+
+A checkpoint composed from **LoRA** adapters (the baseline that aLoRA is
+compared against) puts the control token at position 0 instead, in place of the
+first ``<|start_of_role|>``, as the composed chat template does. Every adapter
+then has its own KV from the first token on, and nothing is shared.
+
+Prompt ids are assembled directly each tick, which skips Jinja rendering.
+``python policy.py --check-template <model_dir>`` confirms the ids are identical
+to ``apply_chat_template(adapter_name=...)`` (without the block padding, which
+has no chat-template form).
 """
 
 from __future__ import annotations
@@ -33,20 +50,31 @@ from dataclasses import dataclass, field
 
 from doom_env import ACTIONS, WEAPON_SLOTS, Observation
 from expert import BEHAVIORS, Expert
+from history import History, now_prefix
 
 ARMS = "arms"  # weapon planner: one slot digit
 CRITIC = "critic"  # danger of taking damage or dying within 1 s
 ROUTER = "router"
-ADAPTERS: tuple[str, ...] = (*BEHAVIORS, ARMS, CRITIC, ROUTER)
+GAME_ADAPTERS: tuple[str, ...] = (*BEHAVIORS, ARMS, CRITIC)
+ADAPTERS: tuple[str, ...] = (*GAME_ADAPTERS, ROUTER)
 WEAPON_TOKENS: tuple[str, ...] = tuple(str(s) for s in WEAPON_SLOTS)
 DANGER_LEVELS: tuple[str, ...] = ("low", "mid", "high")
+OUTPUTS: dict[str, tuple[str, ...]] = {
+    **{b: ACTIONS for b in BEHAVIORS},
+    ARMS: WEAPON_TOKENS,
+    CRITIC: DANGER_LEVELS,
+    ROUTER: BEHAVIORS,
+}
 
 SYSTEM_PROMPT = (
-    "You play Doom deathmatch against bots. The game state gives health, armor, the "
-    "selected weapon and its ammo, owned weapon slots with ammo; objects on screen as "
-    "name, bearing in degrees (negative is left) and distance; wall clearance left, "
-    "front, right and behind in metres; damage taken in the last second; where an "
-    "enemy was last seen; your last two actions. Reply with what is asked: one action ("
+    "You play Doom deathmatch against bots. First comes a history of the last 10 "
+    "seconds, one line per 0.2 s: match time, health, heading in degrees, the "
+    "enemies in view, your main action, and events. Then the current state: "
+    "health, armor, the selected weapon and its ammo, owned weapon slots with ammo; "
+    "objects on screen as name, bearing in degrees (negative is left) and distance; "
+    "wall clearance left, front, right and behind in metres; damage taken in the "
+    "last second; where an enemy was last seen; your last two actions. Reply with "
+    "what is asked: one action ("
     + " ".join(ACTIONS)
     + "), a weapon slot (1-7), or the danger of being hit soon (low mid high)."
 )
@@ -57,28 +85,31 @@ ROUTER_SYSTEM_PROMPT = (
 )
 
 _SOR, _EOR, _EOT = "<|start_of_role|>", "<|end_of_role|>", "<|end_of_text|>"
+BLOCK = 16  # vLLM's default KV block size, in tokens
+PAD = "\n"
 
-# CUDA-graph capture sizes, in scheduled tokens per engine step. A decision
-# prefills ~45 fresh tokens per game, so the sizes must reach past that for one
-# game and past N x 45 for an N-game batch. vLLM otherwise caps capture at
+# CUDA-graph capture sizes, in scheduled tokens per engine step. A tic prefills
+# the fresh state (~90 tokens) plus a suffix per adapter; a history window
+# reset re-prefills ~700 tokens, and the LoRA baseline re-prefills the whole
+# ~1.6k-token prompt when it switches adapter. vLLM otherwise caps capture at
 # 2 x max_num_seqs, and a larger step runs eagerly and launch-bound: 6 ms -> 17 ms
-# on an H100 for one game.
+# on an H100 for one 45-token decision.
 CAPTURE_SIZES = [
     *(1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256),
-    *(320, 384, 448, 512, 640, 768, 896, 1024),
+    *(320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048),
 ]
 
 
 @dataclass
 class Decision:
-    action: str
+    action: str  # the output word: an action, a slot digit or a danger level
     top3: list[tuple[str, float]]
-    ms: float  # state available -> action available, wall clock
+    ms: float  # state available -> output available, wall clock
     fresh_tokens: int = 0
     cached_tokens: int = 0
     build_ms: float = 0.0  # prompt-id assembly (tokenizing the state)
     engine_ms: float = 0.0  # vLLM: submit -> output (prefill + one token)
-    probs: dict[str, float] = field(default_factory=dict)  # every action
+    probs: dict[str, float] = field(default_factory=dict)  # the whole vocabulary
 
 
 @dataclass
@@ -130,70 +161,145 @@ def route_token_ids(tokenizer) -> dict[str, int]:
     return ids
 
 
-class PromptBuilder:
-    """Pre-tokenized prompt pieces; ``ids`` concatenates them with the fresh text.
+def vocab_ids(tokenizer, adapter: str) -> dict[str, int]:
+    """Output word -> token id for an adapter's one output token."""
+    if adapter == ROUTER:
+        return route_token_ids(tokenizer)
+    return output_token_ids(tokenizer, OUTPUTS[adapter])
 
-    ``adapter=None`` gives the base-model prompt (what PEFT trains on).
-    Otherwise the adapter's control token takes the place of the
-    ``<|start_of_role|>`` that opens the assistant header, exactly as the
-    composed chat template renders an aLoRA whose invocation sequence is
-    ``<|start_of_role|>assistant<|end_of_role|>``. At runtime the switch gives
-    the control token ``<|start_of_role|>``'s embedding, so the model sees the
+
+def state_text(obs: Observation) -> str:
+    """The current-state part of the game prompt: match time, then the state line."""
+    return now_prefix(obs.tick) + obs.text
+
+
+class PromptBuilder:
+    """Pre-tokenized prompt pieces, joined with the fresh text each tic.
+
+    ``adapter=None`` gives the base-model prompt (what PEFT trains on). For an
+    aLoRA, the control token takes the place of the ``<|start_of_role|>`` that
+    opens the assistant header, exactly as the composed chat template renders an
+    aLoRA whose invocation sequence is ``<|start_of_role|>assistant<|end_of_role|>``.
+    For a LoRA (``lora=True``) it takes the place of the first
+    ``<|start_of_role|>``, at position 0. Either way the switch gives the control
+    token ``<|start_of_role|>``'s embedding at runtime, so the model sees the
     sequence it was trained on.
+
+    ``align=False`` drops the block padding (for the chat-template check).
     """
 
-    def __init__(self, tokenizer, system: str, adapters: tuple[str, ...] = ()):
+    def __init__(
+        self,
+        tokenizer,
+        system: str,
+        adapters: tuple[str, ...] = (),
+        *,
+        lora: bool = False,
+        align: bool = True,
+        block: int = BLOCK,
+    ):
         self.tok = tokenizer
-        self.prefix = self._enc(f"{_SOR}system{_EOR}{system}{_EOT}\n{_SOR}user{_EOR}")
-        self.suffix = {None: self._enc(f"{_EOT}\n{_SOR}assistant{_EOR}")}
+        self.lora = lora
+        self.block = block if align else 0
+        self.pad_id = single_token_id(tokenizer, PAD)
+        body = self._enc(f"system{_EOR}{system}{_EOT}\n{_SOR}user{_EOR}")
+        base_suffix = self._enc(f"{_EOT}\n{_SOR}assistant{_EOR}")
+        self.head = {None: self._enc(_SOR) + body}
+        self.suffix = {None: base_suffix}
         for a in adapters:
-            self.suffix[a] = self._enc(f"{_EOT}\n{control_token(a)}assistant{_EOR}")
+            ctl = self._enc(control_token(a))
+            if lora:
+                self.head[a] = ctl + body
+                self.suffix[a] = base_suffix
+            else:
+                self.head[a] = self.head[None]
+                self.suffix[a] = self._enc(f"{_EOT}\n{control_token(a)}assistant{_EOR}")
         self.system = system
 
     def _enc(self, s: str) -> list[int]:
         return self.tok.encode(s, add_special_tokens=False)
 
+    def _pad(self, n: int) -> list[int]:
+        return [self.pad_id] * (-n % self.block) if self.block else []
+
     def ids(self, text: str, adapter: str | None) -> list[int]:
-        return self.prefix + self._enc(text) + self.suffix[adapter]
+        """A prompt without history (the router's)."""
+        return self.head[adapter] + self._enc(text) + self.suffix[adapter]
+
+    def game_ids(
+        self, history_ids: list[int], state: str, adapters: list[str | None]
+    ) -> list[list[int]]:
+        """One game prompt per adapter, sharing everything before the suffix."""
+        n_head = len(self.head[None])  # every head has the same length
+        pre = history_ids + self._pad(n_head + len(history_ids))
+        body = pre + self._enc(state)
+        body = body + self._pad(n_head + len(body))
+        return [self.head[a] + body + self.suffix[a] for a in adapters]
 
     def n_fixed(self) -> int:
-        return len(self.prefix)
+        return len(self.head[None])
 
 
 def alora_invocation_ids(tokenizer) -> list[int]:
     return tokenizer.encode(f"{_SOR}assistant{_EOR}", add_special_tokens=False)
 
 
-def check_template(model_dir: str, texts: list[str]) -> None:
-    """Assert direct id assembly == ``apply_chat_template`` for every adapter."""
+def is_lora_checkpoint(tokenizer) -> bool:
+    """True if the composed chat template places control tokens at position 0."""
+    if control_token(BEHAVIORS[0]) not in tokenizer.get_vocab():
+        return False
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "x"}],
+        add_generation_prompt=True,
+        tokenize=False,
+        adapter_name=BEHAVIORS[0],
+    )
+    return rendered.startswith(control_token(BEHAVIORS[0]))
+
+
+def check_template(model_dir: str, games: list[tuple[str, str]], routes: list[str]):
+    """Assert direct id assembly == ``apply_chat_template`` for every adapter.
+
+    ``games`` holds (history text, state text) pairs from real play.
+    """
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_dir)
     composed = control_token(BEHAVIORS[0]) in tok.get_vocab()
+    lora = is_lora_checkpoint(tok)
+    game_names = (*GAME_ADAPTERS, None) if composed else (None,)
+    route_names = (ROUTER, None) if composed else (None,)
     adapters = ADAPTERS if composed else ()
-    for system, names in (
-        (SYSTEM_PROMPT, (*BEHAVIORS, ARMS, CRITIC, None)),
-        (ROUTER_SYSTEM_PROMPT, (ROUTER, None)),
-    ):
-        pb = PromptBuilder(tok, system, adapters)
-        for text in texts:
-            msgs = [
-                {"role": "system", "content": system},
-                {"role": "user", "content": text},
-            ]
-            for a in names if composed else (None,):
-                kw = {"adapter_name": a} if a else {}
-                rendered = tok.apply_chat_template(
-                    msgs, add_generation_prompt=True, tokenize=False, **kw
-                )
-                ref = tok(rendered, add_special_tokens=False).input_ids
-                got = pb.ids(text, a)
-                assert got == ref, f"adapter={a}\n got={got}\n ref={ref}\n{rendered!r}"
+    pb = PromptBuilder(tok, SYSTEM_PROMPT, adapters, lora=lora, align=False)
+    rb = PromptBuilder(tok, ROUTER_SYSTEM_PROMPT, adapters, lora=lora, align=False)
+
+    def rendered_ids(system: str, user: str, a: str | None) -> tuple[list[int], str]:
+        msgs = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        kw = {"adapter_name": a} if a else {}
+        r = tok.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=False, **kw
+        )
+        return tok(r, add_special_tokens=False).input_ids, r
+
+    for hist_text, state in games:
+        hist_ids = tok.encode(hist_text, add_special_tokens=False)
+        got = pb.game_ids(hist_ids, state, list(game_names))
+        for a, g in zip(game_names, got):
+            ref, r = rendered_ids(SYSTEM_PROMPT, hist_text + state, a)
+            assert g == ref, f"adapter={a}\n got={g}\n ref={ref}\n{r!r}"
+    for text in routes:
+        for a in route_names:
+            ref, r = rendered_ids(ROUTER_SYSTEM_PROMPT, text, a)
+            assert rb.ids(text, a) == ref, f"adapter={a}\n{r!r}"
     check_output_tokens(tok)
+    kind = "LoRA" if lora else "aLoRA"
+    what = f"{kind} adapters {', '.join(ADAPTERS)} and base" if composed else "base"
     print(
-        f"OK: prompt ids match apply_chat_template for "
-        f"{'adapters ' + ', '.join(ADAPTERS) + ' and base' if composed else 'the base template'} "
-        f"on {len(texts)} states."
+        f"OK: prompt ids match apply_chat_template for {what} on {len(games)} "
+        f"history+state prompts and {len(routes)} instructions."
     )
 
 
@@ -248,9 +354,19 @@ def keyword_route(instruction: str) -> Route:
     return Route(best, probs[best], (time.perf_counter() - t0) * 1000, probs)
 
 
+def rule_danger(obs: Observation) -> str:
+    """A rule-based stand-in for the critic adapter: recent damage or a close bot."""
+    foes = [o for o in obs.seen if o.kind == "enemy" or o.kind == "missile"]
+    if obs.hit >= 20 or (obs.hit > 0 and obs.hp < 40):
+        return "high"
+    if obs.hit > 0 or any(o.dist < 12 for o in foes):
+        return "mid"
+    return "low"
+
+
 # ── Policies ───────────────────────────────────────────────────────────────────
 class ExpertPolicy:
-    """The scripted teacher behind the same interface as the model."""
+    """The scripted player behind the same interface as the model."""
 
     name = "expert"
 
@@ -260,14 +376,21 @@ class ExpertPolicy:
     def reset(self) -> None:
         self.expert.reset()
 
-    def decide(self, obs: Observation, adapter: str) -> Decision:
+    def decide(
+        self, obs: Observation, adapter: str, history: History | None = None
+    ) -> Decision:
         t0 = time.perf_counter()
-        action = self.expert.act(obs, adapter)
+        if adapter == ARMS:
+            out = str(self.expert.weapon(obs))
+        elif adapter == CRITIC:
+            out = rule_danger(obs)
+        else:
+            out = self.expert.act(obs, adapter)
         ms = (time.perf_counter() - t0) * 1000
-        return Decision(action, [(action, 1.0)], ms, probs={action: 1.0})
+        return Decision(out, [(out, 1.0)], ms, probs={out: 1.0})
 
     def decide_many(
-        self, obs: Observation, adapters: tuple[str, ...]
+        self, obs: Observation, adapters: tuple[str, ...], history=None
     ) -> dict[str, Decision]:
         return {a: self.decide(obs, a) for a in adapters}
 
@@ -279,12 +402,15 @@ class VLLMPolicy:
     """Composed Granite Switch checkpoint served in-process by vLLM.
 
     Args:
-        model: Composed checkpoint directory.
+        model: Composed checkpoint directory. Whether its adapters are aLoRA or
+            LoRA is read from its chat template.
         engine_loop: Drive ``LLMEngine.add_request/step`` directly instead of
-            ``LLM.generate``. The latency test picks whichever is faster.
-        prefix_caching: Keep on; the system prompt is then prefilled once.
-        logprobs_mode: ``processed_logprobs`` so the probabilities are over allowed
-            actions, renormalized.
+            ``LLM.generate``.
+        prefix_caching: Keep on: the system prompt and the history are then
+            prefilled once.
+        align: Pad history and state to KV block boundaries (see module doc).
+        logprobs_mode: ``processed_logprobs`` so the probabilities are over the
+            allowed outputs, renormalized.
         cudagraph_mode: ``FULL`` captures the whole forward, SWITCH kernels
             included, for prefill steps too; ``FULL_AND_PIECEWISE`` is vLLM's
             default.
@@ -292,6 +418,9 @@ class VLLMPolicy:
             generation so a full GC pass does not walk vLLM's object heap in the
             middle of a decision.
         async_scheduling: Passed to vLLM when set; ``None`` keeps its default.
+        base_model: ``model`` is a plain base checkpoint without control tokens;
+            every adapter then maps to the base prompt (the SWITCH-overhead
+            baseline).
     """
 
     name = "vllm"
@@ -302,9 +431,10 @@ class VLLMPolicy:
         *,
         engine_loop: bool = False,
         prefix_caching: bool = True,
-        max_num_seqs: int = 8,
+        align: bool = True,
+        max_num_seqs: int = 16,
         gpu_memory_utilization: float = 0.5,
-        max_model_len: int = 512,
+        max_model_len: int = 2048,
         logprobs_mode: str = "processed_logprobs",
         enforce_eager: bool = False,
         warmup: int = 20,
@@ -312,6 +442,7 @@ class VLLMPolicy:
         cudagraph_mode: str = "FULL",
         gc_freeze: bool = True,
         async_scheduling: bool | None = None,
+        log_stats: bool = False,
     ):
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         from vllm import LLM, SamplingParams
@@ -322,10 +453,14 @@ class VLLMPolicy:
             max_model_len=max_model_len,
             enable_prefix_caching=prefix_caching,
             max_num_seqs=max_num_seqs,
+            # Room for the LoRA baseline to re-prefill five whole prompts in one
+            # step (steps above the largest capture size run eagerly).
+            max_num_batched_tokens=8192,
             gpu_memory_utilization=gpu_memory_utilization,
             max_logprobs=len(ACTIONS),
             logprobs_mode=logprobs_mode,
             enforce_eager=enforce_eager,
+            disable_log_stats=not log_stats,
             compilation_config={
                 "cudagraph_capture_sizes": CAPTURE_SIZES,
                 "cudagraph_mode": cudagraph_mode,
@@ -337,28 +472,26 @@ class VLLMPolicy:
             ),
         )
         self.tok = self.llm.get_tokenizer()
-        # A plain base model (the SWITCH-overhead baseline) has no control
-        # tokens: every adapter then maps to the base prompt.
         self.base_model = base_model
+        self.lora = not base_model and is_lora_checkpoint(self.tok)
         adapters = () if base_model else ADAPTERS
-        self.pb = PromptBuilder(self.tok, SYSTEM_PROMPT, adapters)
-        self.rb = PromptBuilder(self.tok, ROUTER_SYSTEM_PROMPT, adapters)
-        self.action_ids = action_token_ids(self.tok)
-        self.id_to_action = {v: k for k, v in self.action_ids.items()}
-        self.route_ids = route_token_ids(self.tok)
-        self.id_to_route = {v: k for k, v in self.route_ids.items()}
-        self.sp_action = SamplingParams(
-            max_tokens=1,
-            temperature=0.0,
-            allowed_token_ids=list(self.action_ids.values()),
-            logprobs=len(ACTIONS),  # the full distribution, for the heatmap
+        self.pb = PromptBuilder(
+            self.tok, SYSTEM_PROMPT, adapters, lora=self.lora, align=align
         )
-        self.sp_route = SamplingParams(
-            max_tokens=1,
-            temperature=0.0,
-            allowed_token_ids=list(self.route_ids.values()),
-            logprobs=len(BEHAVIORS),
+        self.rb = PromptBuilder(
+            self.tok, ROUTER_SYSTEM_PROMPT, adapters, lora=self.lora, align=False
         )
+        self.vocab = {a: vocab_ids(self.tok, a) for a in ADAPTERS}
+        self.words = {a: {i: w for w, i in v.items()} for a, v in self.vocab.items()}
+        self.sp = {
+            a: SamplingParams(
+                max_tokens=1,
+                temperature=0.0,
+                allowed_token_ids=list(v.values()),
+                logprobs=len(v),  # the full distribution, for the heatmap
+            )
+            for a, v in self.vocab.items()
+        }
         self.engine_loop = engine_loop
         self._warmup(warmup)
         if gc_freeze:
@@ -369,16 +502,17 @@ class VLLMPolicy:
         pass
 
     # ── Engine calls ───────────────────────────────────────────────────────────
-    def _run(self, prompts: list[list[int]], sp) -> list:
+    def run(self, prompts: list[list[int]], sps: list) -> list:
+        """One batch of one-token requests; returns vLLM outputs in order."""
         from vllm.inputs import TokensPrompt
 
         if not self.engine_loop:
             return self.llm.generate(
-                [TokensPrompt(prompt_token_ids=p) for p in prompts], sp, use_tqdm=False
+                [TokensPrompt(prompt_token_ids=p) for p in prompts], sps, use_tqdm=False
             )
         engine = self.llm.llm_engine
         ids = [uuid.uuid4().hex for _ in prompts]
-        for rid, p in zip(ids, prompts):
+        for rid, p, sp in zip(ids, prompts, sps):
             engine.add_request(rid, TokensPrompt(prompt_token_ids=p), sp)
         done: dict[str, object] = {}
         while len(done) < len(ids):
@@ -387,25 +521,23 @@ class VLLMPolicy:
                     done[out.request_id] = out
         return [done[rid] for rid in ids]
 
-    def _adapter(self, adapter: str | None) -> str | None:
+    def _prompt_adapter(self, adapter: str) -> str | None:
         return None if self.base_model else adapter
 
-    @staticmethod
-    def _dist(out, id_map: dict[int, str]) -> list[tuple[str, float]]:
+    def _dist(self, out, adapter: str) -> list[tuple[str, float]]:
+        words = self.words[adapter]
         lp = out.outputs[0].logprobs[0]
-        pairs = [(id_map[i], math.exp(v.logprob)) for i, v in lp.items() if i in id_map]
+        pairs = [(words[i], math.exp(v.logprob)) for i, v in lp.items() if i in words]
         pairs.sort(key=lambda p: -p[1])
         return pairs
 
-    def _decision(self, out, t0: float, t1: float, t2: float) -> Decision:
-        dist = self._dist(out, self.id_to_action)
-        top = dist[:3]
-        action = self.id_to_action[out.outputs[0].token_ids[0]]
+    def _decision(self, out, adapter: str, t0: float, t1: float, t2: float):
+        dist = self._dist(out, adapter)
         n_prompt = len(out.prompt_token_ids)
         cached = out.num_cached_tokens or 0
         return Decision(
-            action,
-            top,
+            self.words[adapter][out.outputs[0].token_ids[0]],
+            dist[:3],
             (time.perf_counter() - t0) * 1000,
             n_prompt - cached,
             cached,
@@ -415,50 +547,59 @@ class VLLMPolicy:
         )
 
     # ── Policy interface ───────────────────────────────────────────────────────
-    def decide(self, obs: Observation | str, adapter: str) -> Decision:
+    def decide_games(
+        self, games: list[tuple[list[int], str]], adapters: list[list[str]]
+    ) -> list[dict[str, Decision]]:
+        """Many games in one engine step. ``games[i]`` is (history ids, state
+        text); ``adapters[i]`` the adapters that game asks this tic. ``ms`` is
+        per step."""
         t0 = time.perf_counter()
-        text = obs if isinstance(obs, str) else obs.text
-        ids = self.pb.ids(text, self._adapter(adapter))
+        prompts, sps, index = [], [], []
+        for g, ((hist, state), names) in enumerate(zip(games, adapters)):
+            ps = self.pb.game_ids(hist, state, [self._prompt_adapter(a) for a in names])
+            prompts += ps
+            sps += [self.sp[a] for a in names]
+            index += [(g, a) for a in names]
         t1 = time.perf_counter()
-        out = self._run([ids], self.sp_action)[0]
-        return self._decision(out, t0, t1, time.perf_counter())
-
-    def decide_batch(self, texts: list[str], adapters: list[str]) -> list[Decision]:
-        """One engine call for many states (DAgger rollouts). ``ms`` is per batch."""
-        t0 = time.perf_counter()
-        prompts = [self.pb.ids(t, self._adapter(a)) for t, a in zip(texts, adapters)]
-        t1 = time.perf_counter()
-        outs = self._run(prompts, self.sp_action)
+        outs = self.run(prompts, sps)
         t2 = time.perf_counter()
-        return [self._decision(o, t0, t1, t2) for o in outs]
+        res: list[dict[str, Decision]] = [{} for _ in games]
+        for (g, a), o in zip(index, outs):
+            res[g][a] = self._decision(o, a, t0, t1, t2)
+        return res
 
     def decide_many(
-        self, obs: Observation, adapters: tuple[str, ...]
+        self, obs: Observation, adapters: tuple[str, ...], history: History | None
     ) -> dict[str, Decision]:
-        """All ``adapters`` on the same state in one engine step (shadow decisions)."""
-        decs = self.decide_batch([obs.text] * len(adapters), list(adapters))
-        return dict(zip(adapters, decs))
+        """Several adapters on the same state, one engine step."""
+        hist = history.ids if history is not None else []
+        return self.decide_games([(hist, state_text(obs))], [list(adapters)])[0]
+
+    def decide(
+        self, obs: Observation, adapter: str, history: History | None = None
+    ) -> Decision:
+        return self.decide_many(obs, (adapter,), history)[adapter]
 
     def route(self, instruction: str) -> Route:
         t0 = time.perf_counter()
-        out = self._run(
-            [self.rb.ids(instruction, self._adapter(ROUTER))], self.sp_route
-        )[0]
-        probs = dict(self._dist(out, self.id_to_route))
-        best = self.id_to_route[out.outputs[0].token_ids[0]]
+        prompt = self.rb.ids(instruction, self._prompt_adapter(ROUTER))
+        out = self.run([prompt], [self.sp[ROUTER]])[0]
+        probs = dict(self._dist(out, ROUTER))
+        best = self.words[ROUTER][out.outputs[0].token_ids[0]]
         return Route(
             best, probs.get(best, 0.0), (time.perf_counter() - t0) * 1000, probs
         )
 
     def _warmup(self, n: int) -> None:
-        text = (
-            "hp 100 armor 0 | pistol 50 | arms 2:50 | see bot -12 8m, medikit +40 3m | "
-            "wall l3 f9 r9 b2 | hit 0 | last forward forward"
+        state = (
+            "now t1.0 | hp 100 armor 0 | pistol 50 | arms 2:50 | see bot -12 8m, "
+            "medikit +40 3m | wall l3 f9 r9 b2 | hit 0 | last forward forward"
         )
+        entry = "t0.2 hp 100 face 90 | bot -12 8m | did forward\n"
+        hist: list[int] = []
         for i in range(n):
-            self.decide(
-                text.replace("-12", f"{-12 - i:+d}"), BEHAVIORS[i % len(BEHAVIORS)]
-            )
+            hist = hist + self.tok.encode(entry, add_special_tokens=False)
+            self.decide_games([(hist, state)], [list(GAME_ADAPTERS[: 1 + i % 5])])
         self.route("go kill everything")
 
 
@@ -481,27 +622,27 @@ def main() -> None:
         help="Composed model dir (or a base model id for the base-template check)",
     )
     ap.add_argument(
-        "--episodes", type=int, default=2, help="Episodes of states to check"
+        "--seconds", type=float, default=40.0, help="Seconds of play to check"
     )
     args = ap.parse_args()
 
-    from doom_env import DoomEnv
+    from doom_env import TIC_HZ, DoomEnv
+    from expert import PLAN_EVERY_TICS
 
-    env = DoomEnv(seed=0)
-    pol = ExpertPolicy()
-    texts = []
-    for ep in range(args.episodes):
-        obs = env.reset(seed=ep)
-        pol.reset()
-        while not obs.done and len(texts) < 400 * (ep + 1):
-            if not obs.dead:
-                texts.append(obs.text)
-            obs = env.step(pol.decide(obs, BEHAVIORS[ep % len(BEHAVIORS)]).action)
+    env = DoomEnv(seed=0, timeout_tics=int(args.seconds * TIC_HZ))
+    ex, hist = Expert(), History()
+    games = []
+    obs = env.reset(seed=0)
+    while not obs.done:
+        a = ex.act(obs, BEHAVIORS[obs.tick // 350 % len(BEHAVIORS)])
+        if not obs.dead and obs.tick % 5 == 0:
+            games.append((hist.text, state_text(obs)))
+        hist.observe(obs, a)
+        w = ex.weapon(obs) if obs.tick % PLAN_EVERY_TICS == 0 else None
+        obs = env.step(a, weapon=w)
     env.close()
-    texts.extend(
-        ["go kill everything", "stay alive, grab health", "collect all the loot"]
-    )
-    check_template(args.check_template, texts[::7])
+    routes = ["go kill everything", "stay alive, grab health", "collect all the loot"]
+    check_template(args.check_template, games[::5], routes)
 
 
 if __name__ == "__main__":

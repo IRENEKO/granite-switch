@@ -55,6 +55,7 @@ from doom_env import (
     TIC_HZ,
     TIC_MS,
     DoomEnv,
+    isolate_workdir,
 )
 from expert import BEHAVIORS, PLAN_EVERY_TICS, Expert
 from policy import make_policy
@@ -99,6 +100,7 @@ def _jpeg(frame: np.ndarray, size: tuple[int, int] | None, quality: int) -> byte
 
 
 def _worker(conn, seed: int) -> None:
+    isolate_workdir()
     env = DoomEnv(seed=seed, resolution="640X480", hud=True, timeout_tics=10**7)
     experts = {b: Expert() for b in BEHAVIORS}
     reaction = _Reaction()
@@ -302,16 +304,17 @@ class GameLoop(threading.Thread):
                     "cached": 0,
                 }
             return out
-        texts = [g.state["text"] for g in due]
+        games = [([], g.state["text"]) for g in due]
         adapters = [g.adapter for g in due]
         if self.shadow and len(due) == 1:
             # The active behavior plus the other two, same state, one step.
             order = [adapters[0], *[b for b in BEHAVIORS if b != adapters[0]]]
-            decs = self.policy.decide_batch(texts * len(order), order)
-            due[0].state["shadow"] = {b: d.action for b, d in zip(order, decs)}
-            decs = decs[:1]
+            many = self.policy.decide_games(games, [order])[0]
+            due[0].state["shadow"] = {b: d.action for b, d in many.items()}
+            decs = [many[adapters[0]]]
         else:
-            decs = self.policy.decide_batch(texts, adapters)
+            many = self.policy.decide_games(games, [[a] for a in adapters])
+            decs = [m[a] for m, a in zip(many, adapters)]
         for g, d in zip(due, decs):
             out[g.index] = {
                 "action": d.action,

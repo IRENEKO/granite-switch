@@ -1,37 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
 """Play deathmatches against bots in parallel ViZDoom envs; write jsonl + stats.
 
-Scripted-expert matches, with DART-style noise for wider state coverage::
+A **teacher** labels every visited state: the scripted player (``--teacher
+expert``, one-hot labels) or an RL checkpoint (``--teacher runs/rl0/latest.pt``,
+soft labels: its whole action distribution). A **driver** chooses the actions:
 
-    python collect.py --policy expert --episodes 50 --timeout-s 120 --dart 0.15 \
-        --out data/round0
+* ``--policy teacher``: the teacher itself, sampling from its distribution
+  (the scripted one adds DART-style noise bursts with ``--dart``)::
 
-Scripted-baseline evaluation, 10-minute matches against the default bots::
+      python collect.py --policy teacher --teacher runs/rl0/latest.pt \
+          --episodes 40 --timeout-s 120 --out data/d0
 
-    python collect.py --policy expert --behaviors fighter --episodes 10 \
-        --bots default --stats-only --out out/baseline_default
+* ``--policy vllm``: the student (a composed checkpoint) drives; the teacher
+  labels what the student visits (DAgger). All envs step in lockstep, so each
+  tic's student decisions (the style adapter every tic, the weapon planner on
+  its cadence) are one batched vLLM call::
 
-Student rollouts for DAgger. The student (composed checkpoint) drives, the
-expert labels every visited state, and all envs step in lockstep so each
-tic's student decisions are one batched vLLM call::
+      python collect.py --policy vllm --model models/doom-d0 \
+          --teacher runs/rl0/latest.pt --episodes 30 --out data/d1
 
-    python collect.py --policy vllm --model ./doom-switch --episodes 30 \
-        --beta 0.0 --out data/round1
+* ``--policy random``: the lockstep path with uniform random actions (a stat
+  baseline, and a plumbing check without a GPU).
 
-``--policy random`` drives the same lockstep path with uniform random actions.
-It is a stat baseline, and a way to exercise the plumbing without a GPU.
-
-Every policy chooses the weapon through the expert's planner every
-``PLAN_EVERY_TICS`` (about 0.5 s). Tics while the player is dead need no
-decision and produce no row.
+``--stats-only`` with 10-minute matches is the evaluation (``--timeout-s 600``,
+the default). Tics while the player is dead need no decision and produce no row.
 
 Outputs in ``--out``:
 
-* ``<behavior>.jsonl``: one row per decided tic, ``{"text", "expert", "act",
-  "weapon", ...}``; ``expert`` is the training label, ``weapon`` the planner's
-  slot on tics where it ran (else null).
-* ``stats.jsonl``: one row per match.
-* ``videos/<behavior>_ep<k>.mp4``: the first ``--record`` matches per behavior.
+* ``<style>.jsonl``: one row per decided tic: ``state`` (the prompt's current
+  state), ``hist_n`` (history entries so far), ``expert`` and ``soft`` (the
+  teacher's move label and distribution), ``weapon`` / ``weapon_soft`` on
+  planner tics, ``critic`` (outcome in the next second), ``probe`` (history-only
+  question, or null), ``act`` (executed).
+* ``<style>_history.jsonl``: per match, every history entry in order, so
+  training rebuilds each row's windowed history (:class:`history.History`).
+* ``stats.jsonl``: one row per match; ``summary.txt``.
+* ``videos/<style>_ep<k>.mp4``: the first ``--record`` matches per style.
 """
 
 from __future__ import annotations
@@ -48,14 +52,23 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from doom_env import ACTIONS, BOT_SETS, MATCH_TICS, TIC_HZ, DoomEnv
+from doom_env import (
+    ACTIONS,
+    BOT_SETS,
+    MATCH_TICS,
+    TIC_HZ,
+    WEAPON_SLOTS,
+    DoomEnv,
+    isolate_workdir,
+)
 from expert import BEHAVIORS, PLAN_EVERY_TICS, Expert
+from history import History, critic_labels, probe_label
 
 RESOLUTION = "640X480"  # one setting everywhere: collection, bench and demo
 
 
 class _Noise:
-    """DART-style noise: bursts of random actions, labels stay the expert's."""
+    """DART-style noise: bursts of random actions, labels stay the teacher's."""
 
     def __init__(self, rate: float, rng: random.Random, max_len: int = 6):
         self.rate, self.rng, self.max_len = rate, rng, max_len
@@ -69,6 +82,50 @@ class _Noise:
             self.left -= 1
             return self.action
         return action
+
+
+class Teacher:
+    """Labels for one game. ``label`` must be called on every live tic (the RL
+    teacher's GRU state follows the game)."""
+
+    def __init__(self, spec: str):
+        self.soft = spec != "expert"
+        if self.soft:
+            from rl_teacher import KEEP, RLPolicy
+
+            self.rl, self.keep = RLPolicy(spec), KEEP
+        else:
+            self.expert = Expert()
+
+    def reset(self) -> None:
+        (self.rl if self.soft else self.expert).reset()
+
+    def label(self, obs, style: str) -> tuple[dict[str, float], dict[str, float]]:
+        """(move distribution over ACTIONS, weapon distribution over slot digits)."""
+        if not self.soft:
+            return (
+                {self.expert.act(obs, style): 1.0},
+                {str(self.expert.weapon(obs, style)): 1.0},
+            )
+        pm, pw = self.rl.step(obs, style)
+        move = {a: float(p) for a, p in zip(ACTIONS, pm)}
+        weapon: dict[str, float] = {}
+        for i, p in enumerate(pw):
+            slot = obs.slot if i == self.keep else WEAPON_SLOTS[i]
+            weapon[str(slot)] = weapon.get(str(slot), 0.0) + float(p)
+        return move, weapon
+
+
+def _argmax(d: dict[str, float]) -> str:
+    return max(d, key=d.get)
+
+
+def _sample(d: dict[str, float], rng: random.Random) -> str:
+    return rng.choices(list(d), weights=list(d.values()))[0]
+
+
+def _round(d: dict[str, float]) -> dict[str, float]:
+    return {k: round(v, 3) for k, v in d.items() if v >= 0.0005}
 
 
 def _writer(path: Path):
@@ -91,106 +148,146 @@ def _make_env(task: dict) -> DoomEnv:
     )
 
 
-def _plan(expert: Expert, obs, behavior: str) -> int | None:
-    """The weapon planner's slot on its cadence, else None (keep pressing the last)."""
-    if obs.tick % PLAN_EVERY_TICS:
-        return None
-    return expert.weapon(obs, behavior)
+class _Match:
+    """One match: the env, the teacher, the history and the rows being written."""
+
+    def __init__(self, task: dict):
+        self.task, self.style = task, task["behavior"]
+        self.env = _make_env(task)
+        self.teacher = Teacher(task["teacher"])
+        self.rng = random.Random(task["seed"])
+        self.noise = _Noise(task["dart"], self.rng)
+        self.hist = History()
+        self.hist_all: list[str] = []  # every entry, unwindowed, for the stream file
+        self.rows: list[dict] = []
+        self.taken: list[float] = []
+        self.deaths: list[float] = []
+        self.video = _writer(Path(task["video"])) if task["video"] else None
+        self.obs = self.env.reset(seed=task["seed"])
+        self.teacher.reset()
+        self.agree = self.decided = 0
+
+    def labels(self):
+        """Teacher labels for the current live tic, plus the row skeleton."""
+        obs = self.obs
+        move, weapon = self.teacher.label(obs, self.style)
+        plan = obs.tick % PLAN_EVERY_TICS == 0
+        row = {
+            "b": self.style,
+            "ep": self.task["ep"],
+            "t": obs.tick,
+            "state": None,  # filled by the caller from policy.state_text
+            "hist_n": len(self.hist_all),
+            "expert": _argmax(move),
+            "soft": _round(move) if self.teacher.soft else None,
+            "weapon": _argmax(weapon) if plan else None,
+            "weapon_soft": _round(weapon) if plan and self.teacher.soft else None,
+            "probe": probe_label(self.hist, obs),
+        }
+        return move, weapon, plan, row
+
+    def record(self, frame: bool = True) -> None:
+        self.taken.append(self.obs.counters["taken"])
+        self.deaths.append(self.obs.counters["deaths"])
+        if self.video is not None and frame:
+            self.video.append_data(self.env.frame())
+
+    def advance(self, action: str, weapon: int | None, row: dict | None) -> None:
+        """Apply ``action`` for this tic; history and bookkeeping follow."""
+        if row is not None:
+            row["act"] = action
+            if self.task["keep_rows"]:
+                self.rows.append(row)
+        entry = self.hist.observe(self.obs, None if self.obs.dead else action)
+        if entry is not None:
+            self.hist_all.append(entry)
+        self.obs = self.env.step(action, weapon=weapon)
+
+    def finish(self, **extra) -> dict:
+        if self.video is not None:
+            self.video.close()
+        self.env.close()
+        ticks = [r["t"] for r in self.rows]
+        for r, c in zip(self.rows, critic_labels(self.taken, self.deaths, ticks)):
+            r["critic"] = c
+        stats = {
+            "behavior": self.style,
+            "ep": self.task["ep"],
+            "seed": self.task["seed"],
+            "bots": self.task["bots"],
+            "policy": self.task["policy"],
+            "teacher": self.task["teacher"],
+            **extra,
+            **self.env.stats.as_dict(),
+        }
+        history = {"b": self.style, "ep": self.task["ep"], "entries": self.hist_all}
+        return {"rows": self.rows, "history": history, "stats": stats}
 
 
-def _stats(task: dict, env: DoomEnv, **extra) -> dict:
-    return {
-        "behavior": task["behavior"],
-        "ep": task["ep"],
-        "seed": task["seed"],
-        "bots": task["bots"],
-        "policy": task["policy"],
-        **extra,
-        **env.stats.as_dict(),
-    }
+# ── Teacher-driven path: each worker plays whole matches on its own ─────────────
+def _teacher_episode(task: dict) -> dict:
+    from policy import state_text
 
-
-# ── Expert path: each worker runs whole matches on its own ──────────────────────
-def _expert_episode(task: dict) -> dict:
-    env = _make_env(task)
-    expert, rng = Expert(), random.Random(task["seed"])
-    noise = _Noise(task["dart"], rng)
-    b = task["behavior"]
-    obs = env.reset(seed=task["seed"])
-    rows, video = [], _writer(Path(task["video"])) if task["video"] else None
-    while not obs.done:
-        if video is not None:
-            video.append_data(env.frame())
-        if obs.dead:
-            obs = env.step("wait")
+    isolate_workdir()
+    m = _Match(task)
+    while not m.obs.done:
+        m.record()
+        if m.obs.dead:
+            m.advance("wait", None, None)
             continue
-        label = expert.act(obs, b)
-        weapon = _plan(expert, obs, b)
-        act = noise(label)
-        if task["keep_rows"]:
-            rows.append(
-                {
-                    "b": b,
-                    "ep": task["ep"],
-                    "t": obs.tick,
-                    "text": obs.text,
-                    "expert": label,
-                    "act": act,
-                    "weapon": weapon,
-                }
-            )
-        obs = env.step(act, weapon=weapon)
-    if video is not None:
-        video.close()
-    env.close()
-    return {"rows": rows, "stats": _stats(task, env)}
+        move, weapon, plan, row = m.labels()
+        row["state"] = state_text(m.obs)
+        if m.teacher.soft:
+            act = _sample(move, m.rng)
+            slot = int(_sample(weapon, m.rng)) if plan else None
+        else:
+            act = m.noise(row["expert"])
+            slot = int(row["weapon"]) if plan else None
+        m.advance(act, slot, row)
+    return m.finish()
 
 
-# ── Lockstep path: the main process decides for every env each tick ─────────────
+# ── Lockstep path: the main process decides for every env each tic ──────────────
 def _lockstep_worker(conn, tasks: list[dict]) -> None:
+    from policy import state_text
+
+    isolate_workdir()
     for task in tasks:
-        env = _make_env(task)
-        expert, rng = Expert(), random.Random(task["seed"])
-        b = task["behavior"]
-        obs = env.reset(seed=task["seed"])
-        rows, agree, decided = [], 0, 0
-        video = _writer(Path(task["video"])) if task["video"] else None
-        while not obs.done:
-            if video is not None:
-                video.append_data(env.frame())
-            if obs.dead:
-                obs = env.step("wait")
+        m = _Match(task)
+        conn.send(("begin",))
+        sent = 0  # history entries already sent to the main process
+        while not m.obs.done:
+            m.record()
+            if m.obs.dead:
+                m.advance("wait", None, None)
                 continue
-            label = expert.act(obs, b)
-            weapon = _plan(expert, obs, b)
-            conn.send(("state", obs.text, b))
-            student = conn.recv()
-            act = label if rng.random() < task["beta"] else student
-            agree += student == label
-            decided += 1
-            if task["keep_rows"]:
-                rows.append(
-                    {
-                        "b": b,
-                        "ep": task["ep"],
-                        "t": obs.tick,
-                        "text": obs.text,
-                        "expert": label,
-                        "student": student,
-                        "act": act,
-                        "weapon": weapon,
-                    }
+            move, weapon, plan, row = m.labels()
+            row["state"] = state_text(m.obs)
+            new = m.hist_all[sent:]
+            sent = len(m.hist_all)
+            conn.send(("state", row["state"], new, m.style, plan))
+            student, student_slot = conn.recv()
+            use_teacher = m.rng.random() < task["beta"]
+            act = row["expert"] if use_teacher else student
+            slot = None
+            if plan:
+                slot = (
+                    int(row["weapon"])
+                    if use_teacher or student_slot is None
+                    else student_slot
                 )
-            obs = env.step(act, weapon=weapon)
-        if video is not None:
-            video.close()
-        env.close()
-        stats = _stats(task, env, agreement=round(agree / max(1, decided), 4))
-        conn.send(("episode", {"rows": rows, "stats": stats}))
+            m.agree += student == row["expert"]
+            m.decided += 1
+            row["student"] = student
+            m.advance(act, slot, row)
+        res = m.finish(agreement=round(m.agree / max(1, m.decided), 4))
+        conn.send(("episode", res))
     conn.send(("done",))
 
 
 def _run_lockstep(tasks: list[dict], workers: int, decide_batch, on_episode) -> None:
+    """``decide_batch(keys, states, styles, plans)`` -> [(action, slot|None)]; each
+    key's history entries arrive through ``on_entries`` first."""
     ctx = mp.get_context("spawn")
     shards = [tasks[i::workers] for i in range(workers)]
     procs, conns = [], []
@@ -204,24 +301,69 @@ def _run_lockstep(tasks: list[dict], workers: int, decide_batch, on_episode) -> 
         conns.append(parent)
     active = list(conns)
     while active:
-        pending = []  # (conn, text, behavior)
+        pending = []  # (conn, state, new entries, style, plan)
         for c in list(active):
             while True:
                 msg = c.recv()
                 if msg[0] == "state":
-                    pending.append((c, msg[1], msg[2]))
+                    pending.append((c, *msg[1:]))
                     break
+                if msg[0] == "begin":
+                    decide_batch.begin(c)
+                    continue
                 if msg[0] == "episode":
                     on_episode(msg[1])
                     continue
                 active.remove(c)
                 break
         if pending:
-            actions = decide_batch([p[1] for p in pending], [p[2] for p in pending])
-            for (c, _, _), a in zip(pending, actions):
-                c.send(a)
+            outs = decide_batch(pending)
+            for (c, *_), out in zip(pending, outs):
+                c.send(out)
     for p in procs:
         p.join()
+
+
+class _StudentBatch:
+    """The student behind the lockstep: one tokenized history per game."""
+
+    def __init__(self, pol):
+        from policy import ARMS
+
+        self.pol, self.arms = pol, ARMS
+        self.hist: dict[object, History] = {}
+
+    def begin(self, key) -> None:
+        self.hist[key] = History(self.pol.tok)
+
+    def __call__(self, pending):
+        games, adapters = [], []
+        for c, state, new, style, plan in pending:
+            h = self.hist[c]
+            for e in new:
+                h.append(e)
+            games.append((h.ids, state))
+            adapters.append([style, self.arms] if plan else [style])
+        decs = self.pol.decide_games(games, adapters)
+        out = []
+        for (_, _, _, style, plan), d in zip(pending, decs):
+            slot = int(d[self.arms].action) if plan else None
+            out.append((d[style].action, slot))
+        return out
+
+
+class _RandomBatch:
+    def __init__(self, seed: int):
+        self.rng = random.Random(seed)
+
+    def begin(self, key) -> None:
+        pass
+
+    def __call__(self, pending):
+        return [
+            (self.rng.choice(ACTIONS), self.rng.choice(WEAPON_SLOTS) if p[4] else None)
+            for p in pending
+        ]
 
 
 # ── Reporting ──────────────────────────────────────────────────────────────────
@@ -267,7 +409,12 @@ def summarize(stats: list[dict]) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--policy", choices=("expert", "vllm", "random"), default="expert")
+    ap.add_argument(
+        "--policy", choices=("teacher", "vllm", "random"), default="teacher"
+    )
+    ap.add_argument(
+        "--teacher", default="expert", help="'expert' or an rl_teacher.py checkpoint"
+    )
     ap.add_argument("--model", help="Composed checkpoint (for --policy vllm)")
     ap.add_argument(
         "--behaviors", nargs="+", default=list(BEHAVIORS), choices=BEHAVIORS
@@ -280,10 +427,10 @@ def main() -> None:
         "--timeout-s", type=float, default=MATCH_TICS / TIC_HZ, help="Match length"
     )
     ap.add_argument(
-        "--dart", type=float, default=0.0, help="Noise-burst rate (expert only)"
+        "--dart", type=float, default=0.0, help="Noise-burst rate (scripted teacher)"
     )
     ap.add_argument(
-        "--beta", type=float, default=0.0, help="DAgger: P(execute expert label)"
+        "--beta", type=float, default=0.0, help="DAgger: P(execute teacher label)"
     )
     ap.add_argument("--record", type=int, default=0, help="MP4s per behavior")
     ap.add_argument("--seed", type=int, default=0)
@@ -293,7 +440,11 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
 
+    args.out = args.out.resolve()  # workers run in their own directories
     args.out.mkdir(parents=True, exist_ok=True)
+    teacher = (
+        args.teacher if args.teacher == "expert" else str(Path(args.teacher).resolve())
+    )
     tasks = []
     for bi, b in enumerate(args.behaviors):
         for ep in range(args.episodes):
@@ -305,6 +456,7 @@ def main() -> None:
                     "timeout": int(args.timeout_s * TIC_HZ),
                     "bots": args.bots,
                     "n_bots": args.n_bots,
+                    "teacher": teacher,
                     "dart": args.dart,
                     "beta": args.beta,
                     "policy": args.policy,
@@ -315,11 +467,11 @@ def main() -> None:
                 }
             )
 
-    row_files = (
-        {b: open(args.out / f"{b}.jsonl", "w") for b in args.behaviors}
-        if not args.stats_only
-        else {}
-    )
+    row_files, hist_files = {}, {}
+    if not args.stats_only:
+        for b in args.behaviors:
+            row_files[b] = open(args.out / f"{b}.jsonl", "w")
+            hist_files[b] = open(args.out / f"{b}_history.jsonl", "w")
     stats_f = open(args.out / "stats.jsonl", "w")
     all_stats: list[dict] = []
     n_rows = 0
@@ -334,6 +486,7 @@ def main() -> None:
             f = row_files[s["behavior"]]
             for r in res["rows"]:
                 f.write(json.dumps(r) + "\n")
+            hist_files[s["behavior"]].write(json.dumps(res["history"]) + "\n")
             n_rows += len(res["rows"])
         print(
             f"[{len(all_stats)}/{len(tasks)}] {s['behavior']:<9} ep{s['ep']:<3} "
@@ -345,28 +498,24 @@ def main() -> None:
         )
 
     t0 = time.time()
-    if args.policy == "expert":
+    if args.policy == "teacher":
         ctx = mp.get_context("spawn")
         with ctx.Pool(args.workers) as pool:
-            for res in pool.imap_unordered(_expert_episode, tasks):
+            for res in pool.imap_unordered(_teacher_episode, tasks):
                 on_episode(res)
     else:
         if args.policy == "vllm":
             from policy import VLLMPolicy
 
-            pol = VLLMPolicy(args.model, max_num_seqs=max(8, args.workers), warmup=5)
-
-            def decide_batch(texts, behaviors):
-                return [d.action for d in pol.decide_batch(texts, behaviors)]
+            pol = VLLMPolicy(
+                args.model, max_num_seqs=max(16, 2 * args.workers), warmup=5
+            )
+            batch = _StudentBatch(pol)
         else:
-            rng = random.Random(args.seed)
+            batch = _RandomBatch(args.seed)
+        _run_lockstep(tasks, args.workers, batch, on_episode)
 
-            def decide_batch(texts, behaviors):
-                return [rng.choice(ACTIONS) for _ in texts]
-
-        _run_lockstep(tasks, args.workers, decide_batch, on_episode)
-
-    for f in row_files.values():
+    for f in [*row_files.values(), *hist_files.values()]:
         f.close()
     stats_f.close()
     table = summarize(all_stats)

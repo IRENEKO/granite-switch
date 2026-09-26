@@ -1,25 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Train one demo aLoRA with PEFT: loss on the single output token only.
+"""Train one demo adapter with PEFT: loss on the single output token only.
 
-Adapted from ``peft/examples/alora_finetuning/alora_finetuning.py``. Differences:
-the prompt is assembled exactly like the demo's inference prompt
-(:class:`policy.PromptBuilder`, base-model form), and the loss is cross-entropy
-over the allowed output tokens at the last position. Every example has one
-target token.
+Adapted from ``peft/examples/alora_finetuning/alora_finetuning.py``. The prompt
+is assembled exactly like the demo's inference prompt (:class:`policy.PromptBuilder`,
+base-model form): system prompt, the row's windowed 5 Hz history (rebuilt from
+the match's history stream), the current state, the assistant header. The loss
+is cross-entropy at the last position over the adapter's output vocabulary.
+Labels are the teacher's whole distribution when it has one (``soft``, from the
+RL teacher; this is KL to the teacher up to a constant), else one-hot.
 
-Behavior adapter, from collect.py rows (label = ``expert``)::
+Adapters and their labels (rows from ``collect.py``):
 
-    python train_alora.py --adapter fighter --data data/round0/fighter.jsonl \
-        data/round1/fighter.jsonl --base /path/granite-4.1-3b --out runs/r1/fighter
+* ``fighter`` / ``cautious`` / ``collector``: the teacher's move, every tic.
+* ``arms``: the teacher's weapon slot, planner tics only.
+* ``critic``: ``low`` / ``mid`` / ``high``, the outcome of the next second.
+* ``probe``: where the last enemy in the history was (history-only question;
+  used for the aLoRA-vs-LoRA comparison, not composed into the demo).
+* ``router``: rows from ``router_data.py`` (instruction, label); no history.
 
-Router, from router_data.py rows (label = ``label``)::
+``--kind lora`` trains a plain LoRA on the same data and prompts: the baseline
+the aLoRA is compared against. Settings follow IBM's shipped aLoRAs: rank 32
+on every linear layer.
 
+::
+
+    python train_alora.py --adapter fighter --data data/d0 data/d1 \
+        --base /path/granite-4.1-3b --out runs/d1/fighter
     python train_alora.py --adapter router --data data/router/train.jsonl \
-        --eval-data data/router/heldout.jsonl --epochs 4 --out runs/r1/router
+        --eval-data data/router/heldout.jsonl --epochs 4 --out runs/router/router
 
-Writes the PEFT adapter to ``--out``, plus ``metrics.json`` and
-``heldout_preds.jsonl`` (text + PEFT argmax), which ``build_model.py verify``
-compares against the composed checkpoint.
+Writes the PEFT adapter to ``--out``, ``metrics.json`` and
+``heldout_preds.jsonl`` (history ids, state and the PEFT argmax per held-out
+row), which ``build_model.py verify`` compares against the composed checkpoint.
 """
 
 from __future__ import annotations
@@ -36,43 +48,99 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from history import PROBE_WORDS, History
 from policy import (
+    ARMS,
+    CRITIC,
+    DANGER_LEVELS,
+    OUTPUTS,
     ROUTER,
     ROUTER_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     PromptBuilder,
-    action_token_ids,
     alora_invocation_ids,
+    output_token_ids,
     route_token_ids,
 )
 
-DEFAULT_TARGETS = "q_proj,k_proj,v_proj,o_proj"
+PROBE = "probe"
+DEFAULT_TARGETS = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+VOCAB = {**OUTPUTS, PROBE: PROBE_WORDS}
 
 
-def load_rows(paths: list[Path], label_key: str) -> list[dict]:
-    rows = []
-    for p in paths:
-        with open(p) as f:
-            for line in f:
+# ── Data ───────────────────────────────────────────────────────────────────────
+class Stream:
+    """One match's history entries, tokenized once; ``ids(n)`` is the windowed
+    history after the first ``n`` entries (the same rule as History.append)."""
+
+    def __init__(self, entries: list[str], tok):
+        h = History(tok)
+        self.starts, self.entry_ids = [0], []
+        for e in entries:
+            h.append(e)
+            self.starts.append(len(self.entry_ids) + 1 - len(h.entries))
+            self.entry_ids.append(h.entry_ids[-1])
+
+    def ids(self, n: int) -> list[int]:
+        return [i for e in self.entry_ids[self.starts[n] : n] for i in e]
+
+
+def row_target(r: dict, adapter: str) -> dict[str, float] | None:
+    """The adapter's label distribution for one collect.py row, or None to skip."""
+    if adapter == ARMS:
+        if r.get("weapon") is None:
+            return None
+        return r.get("weapon_soft") or {r["weapon"]: 1.0}
+    if adapter == CRITIC:
+        return {r["critic"]: 1.0}
+    if adapter == PROBE:
+        return {r["probe"]: 1.0} if r.get("probe") else None
+    return r.get("soft") or {r["expert"]: 1.0}
+
+
+def load_game_rows(dirs: list[Path], adapter: str, styles: list[str], tok, every: int):
+    """Rows as (stream, hist_n, state, target, episode key); history streams are
+    tokenized once per match."""
+    out, streams = [], {}
+    for d in dirs:
+        for style in styles:
+            hp, rp = d / f"{style}_history.jsonl", d / f"{style}.jsonl"
+            if not rp.exists():
+                continue
+            for line in open(hp):
+                h = json.loads(line)
+                streams[(str(d), style, h["ep"])] = Stream(h["entries"], tok)
+            for line in open(rp):
                 r = json.loads(line)
-                rows.append(
-                    {
-                        "text": r["text"],
-                        "label": r[label_key],
-                        "ep": (str(p), r.get("ep", 0)),
-                    }
-                )
-    return rows
+                if r["t"] % every:
+                    continue
+                target = row_target(r, adapter)
+                if target is None:
+                    continue
+                key = (str(d), style, r["ep"])
+                out.append((streams[key], r["hist_n"], r["state"], target, key))
+    return out
 
 
-def split_by_episode(rows: list[dict], val_frac: float, seed: int) -> tuple[list, list]:
-    """Hold out whole episodes: consecutive tics are near-duplicates."""
-    eps = sorted({r["ep"] for r in rows})
+def load_router_rows(paths: list[Path]):
+    out = []
+    for p in paths:
+        for line in open(p):
+            r = json.loads(line)
+            out.append(
+                (None, 0, r["text"], {r["label"]: 1.0}, (str(p), r.get("ep", 0)))
+            )
+    return out
+
+
+def split_by_episode(rows: list, val_frac: float, seed: int) -> tuple[list, list]:
+    """Hold out whole matches: consecutive tics are near-duplicates."""
+    eps = sorted({r[4] for r in rows})
     random.Random(seed).shuffle(eps)
     n_val = max(1, int(len(eps) * val_frac)) if len(eps) > 1 else 0
     val_eps = set(eps[:n_val])
-    return [r for r in rows if r["ep"] not in val_eps], [
-        r for r in rows if r["ep"] in val_eps
+    return [r for r in rows if r[4] not in val_eps], [
+        r for r in rows if r[4] in val_eps
     ]
 
 
@@ -84,20 +152,21 @@ def batches(items: list, size: int, shuffle: bool, seed: int):
         yield [items[j] for j in idx[i : i + size]]
 
 
-def collate(batch: list[tuple[list[int], int]], pad_id: int, device):
+# ── Model helpers ──────────────────────────────────────────────────────────────
+def collate(prompts: list[list[int]], targets: list[list[float]], pad_id: int, device):
     """Left-pad so every prompt ends at the last position; explicit position ids
     keep RoPE identical to the unpadded prompt the engine sees at inference."""
     import torch
 
-    n = max(len(ids) for ids, _ in batch)
-    input_ids = torch.full((len(batch), n), pad_id, dtype=torch.long)
-    mask = torch.zeros((len(batch), n), dtype=torch.long)
-    for i, (ids, _) in enumerate(batch):
-        input_ids[i, n - len(ids) :] = torch.tensor(ids)
-        mask[i, n - len(ids) :] = 1
+    n = max(len(p) for p in prompts)
+    input_ids = torch.full((len(prompts), n), pad_id, dtype=torch.long)
+    mask = torch.zeros((len(prompts), n), dtype=torch.long)
+    for i, p in enumerate(prompts):
+        input_ids[i, n - len(p) :] = torch.tensor(p)
+        mask[i, n - len(p) :] = 1
     pos = (mask.cumsum(-1) - 1).clamp(min=0)
-    targets = torch.tensor([t for _, t in batch])
-    return input_ids.to(device), mask.to(device), pos.to(device), targets.to(device)
+    tgt = torch.tensor(targets, dtype=torch.float32)
+    return input_ids.to(device), mask.to(device), pos.to(device), tgt.to(device)
 
 
 def last_logits(model, input_ids, mask, pos, allowed):
@@ -107,65 +176,58 @@ def last_logits(model, input_ids, mask, pos, allowed):
     return out.logits[:, -1, :][:, allowed].float()
 
 
-def evaluate(
-    model, items, bs, pad_id, device, allowed, classes
-) -> tuple[dict, list[int]]:
-    import torch
-
-    model.eval()
-    preds, correct = [], 0
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        for b in batches(items, bs, False, 0):
-            ids, m, p, t = collate(b, pad_id, device)
-            pr = last_logits(model, ids, m, p, allowed).argmax(-1)
-            correct += int((pr == t).sum())
-            preds.extend(pr.tolist())
-    model.train()
-    gold = [t for _, t in items]
-    maj = Counter(gold).most_common(1)[0]
-    per = {}
-    for ci, c in enumerate(classes):
-        idx = [i for i, g in enumerate(gold) if g == ci]
-        if idx:
-            per[c] = {
-                "n": len(idx),
-                "acc": round(sum(preds[i] == ci for i in idx) / len(idx), 4),
-            }
-    return {
-        "n": len(items),
-        "acc": round(correct / max(1, len(items)), 4),
-        "majority_class": classes[maj[0]],
-        "majority_baseline": round(maj[1] / max(1, len(items)), 4),
-        "per_class": per,
-    }, preds
+def auc(scores: list[float], positives: list[bool]) -> float | None:
+    """Rank AUC (probability a random positive outscores a random negative)."""
+    pos = [s for s, y in zip(scores, positives) if y]
+    neg = [s for s, y in zip(scores, positives) if not y]
+    if not pos or not neg:
+        return None
+    ranked = sorted([(s, 1) for s in pos] + [(s, 0) for s in neg])
+    rank_sum, i = 0.0, 0
+    while i < len(ranked):  # average ranks over ties
+        j = i
+        while j < len(ranked) and ranked[j][0] == ranked[i][0]:
+            j += 1
+        r = (i + j + 1) / 2
+        rank_sum += r * sum(y for _, y in ranked[i:j])
+        i = j
+    return (rank_sum - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg))
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--adapter", required=True, choices=sorted(VOCAB))
     ap.add_argument(
-        "--adapter", required=True, help="fighter | cautious | collector | router"
-    )
-    ap.add_argument("--data", type=Path, nargs="+", required=True)
-    ap.add_argument(
-        "--eval-data",
+        "--data",
         type=Path,
-        nargs="*",
-        help="Explicit held-out set (default: split by episode)",
+        nargs="+",
+        required=True,
+        help="collect.py dirs (router: jsonl)",
     )
+    ap.add_argument("--eval-data", type=Path, nargs="*", help="Explicit held-out set")
+    ap.add_argument(
+        "--styles",
+        nargs="+",
+        help="Row files to read (default: the adapter's own, "
+        "or every style for arms/critic/probe)",
+    )
+    ap.add_argument("--kind", choices=("alora", "lora"), default="alora")
     ap.add_argument("--base", default="ibm-granite/granite-4.1-3b")
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--rank", type=int, default=16)
-    ap.add_argument("--alpha", type=float, default=32.0)
+    ap.add_argument("--rank", type=int, default=32)
+    ap.add_argument("--alpha", type=float, default=64.0)
     ap.add_argument("--targets", default=DEFAULT_TARGETS)
     ap.add_argument("--dropout", type=float, default=0.05)
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--batch", type=int, default=64)
-    ap.add_argument(
-        "--max-examples", type=int, default=150_000, help="Subsample training rows"
-    )
-    ap.add_argument("--val-frac", type=float, default=0.05)
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--micro", type=int, default=8, help="Micro-batch (memory)")
+    ap.add_argument("--every", type=int, default=3, help="Keep every k-th tic")
+    ap.add_argument("--max-examples", type=int, default=150_000)
+    ap.add_argument("--max-heldout", type=int, default=4000)
+    ap.add_argument("--val-frac", type=float, default=0.08)
     ap.add_argument("--eval-every", type=int, default=500)
+    ap.add_argument("--grad-ckpt", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -176,38 +238,68 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     tok = AutoTokenizer.from_pretrained(args.base)
-    is_router = args.adapter == ROUTER
-    label_key = "label" if is_router else "expert"
-    if is_router:
+    a = args.adapter
+    if a == ROUTER:
         label_ids = route_token_ids(tok)
-        pb = PromptBuilder(tok, ROUTER_SYSTEM_PROMPT)
+        pb = PromptBuilder(tok, ROUTER_SYSTEM_PROMPT, align=False)
+        rows = load_router_rows(args.data)
+        val_rows = load_router_rows(args.eval_data) if args.eval_data else None
     else:
-        label_ids = action_token_ids(tok)
+        label_ids = output_token_ids(tok, VOCAB[a])
         pb = PromptBuilder(tok, SYSTEM_PROMPT)
+        styles = args.styles or (
+            [a]
+            if a in OUTPUTS and OUTPUTS[a] == OUTPUTS["fighter"]
+            else ["fighter", "cautious", "collector"]
+        )
+        rows = load_game_rows(args.data, a, styles, tok, args.every)
+        val_rows = (
+            load_game_rows(args.eval_data, a, styles, tok, args.every)
+            if args.eval_data
+            else None
+        )
     classes = list(label_ids)
     allowed = torch.tensor(list(label_ids.values()), device=device)
-
-    rows = load_rows(args.data, label_key)
-    if args.eval_data:
-        train_rows, val_rows = rows, load_rows(args.eval_data, label_key)
-    else:
+    if val_rows is None:
         train_rows, val_rows = split_by_episode(rows, args.val_frac, args.seed)
+    else:
+        train_rows = rows
+    rng = random.Random(args.seed)
     if len(train_rows) > args.max_examples:
-        train_rows = random.Random(args.seed).sample(train_rows, args.max_examples)
+        train_rows = rng.sample(train_rows, args.max_examples)
+    if len(val_rows) > args.max_heldout:
+        val_rows = rng.sample(val_rows, args.max_heldout)
 
-    def encode(rs):
-        return [(pb.ids(r["text"], None), classes.index(r["label"])) for r in rs]
+    def prompt(r) -> list[int]:
+        stream, n, state = r[0], r[1], r[2]
+        if stream is None:
+            return pb.ids(state, None)
+        return pb.game_ids(stream.ids(n), state, [None])[0]
 
-    train, val = encode(train_rows), encode(val_rows)
-    lens = [len(i) for i, _ in train]
+    def target(r) -> list[float]:
+        t = [r[3].get(c, 0.0) for c in classes]
+        s = sum(t)
+        return [x / s for x in t]
+
+    hard = Counter(max(r[3], key=r[3].get) for r in train_rows)
+    lens = [len(prompt(r)) for r in train_rows[:500]]
     print(
-        f"{args.adapter}: {len(train)} train / {len(val)} held-out examples, prompt "
-        f"{min(lens)}-{max(lens)} tokens; label mix {Counter(t for _, t in train).most_common(5)}",
+        f"{a} ({args.kind}): {len(train_rows)} train / {len(val_rows)} held-out rows, "
+        f"prompt {min(lens)}-{max(lens)} tokens (first 500); "
+        f"label mix {hard.most_common(6)}",
         flush=True,
     )
 
     model = AutoModelForCausalLM.from_pretrained(args.base, dtype=torch.bfloat16).to(
         device
+    )
+    if args.grad_ckpt:
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
+    extra = (
+        {"alora_invocation_tokens": alora_invocation_ids(tok)}
+        if args.kind == "alora"
+        else {}
     )
     cfg = LoraConfig(
         task_type="CAUSAL_LM",
@@ -215,14 +307,67 @@ def main() -> None:
         lora_alpha=args.alpha,
         lora_dropout=args.dropout,
         target_modules=args.targets.split(","),
-        alora_invocation_tokens=alora_invocation_ids(tok),
         bias="none",
+        **extra,
     )
     model = get_peft_model(model, cfg)
     model.print_trainable_parameters()
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
-    steps_per_epoch = math.ceil(len(train) / args.batch)
+    def evaluate(items: list) -> tuple[dict, list[list[float]]]:
+        model.eval()
+        probs: list[list[float]] = []
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            for b in batches(items, args.micro, False, 0):
+                ids, m, p, _ = collate(
+                    [prompt(r) for r in b], [target(r) for r in b], pad_id, device
+                )
+                probs += torch.softmax(
+                    last_logits(model, ids, m, p, allowed), -1
+                ).tolist()
+        model.train()
+        tg = [target(r) for r in items]
+        gold = [max(range(len(classes)), key=t.__getitem__) for t in tg]
+        pred = [max(range(len(classes)), key=q.__getitem__) for q in probs]
+        ce = sum(
+            -sum(t_i * math.log(max(q_i, 1e-9)) for t_i, q_i in zip(t, q))
+            for t, q in zip(tg, probs)
+        ) / max(1, len(items))
+        maj = Counter(gold).most_common(1)[0]
+        ev = {
+            "n": len(items),
+            "acc": round(
+                sum(g == q for g, q in zip(gold, pred)) / max(1, len(items)), 4
+            ),
+            "soft_ce": round(ce, 4),
+            "majority_class": classes[maj[0]],
+            "majority_baseline": round(maj[1] / max(1, len(items)), 4),
+            "per_class": {
+                c: {
+                    "n": sum(g == ci for g in gold),
+                    "acc": round(
+                        sum(g == q == ci for g, q in zip(gold, pred))
+                        / max(1, sum(g == ci for g in gold)),
+                        4,
+                    ),
+                }
+                for ci, c in enumerate(classes)
+                if any(g == ci for g in gold)
+            },
+        }
+        if a == CRITIC:
+            hi, lo = DANGER_LEVELS.index("high"), DANGER_LEVELS.index("low")
+            ev["auc_damage_1s"] = auc(
+                [1 - q[classes.index(DANGER_LEVELS[lo])] for q in probs],
+                [g != classes.index("low") for g in gold],
+            )
+            ev["auc_high"] = auc(
+                [q[classes.index(DANGER_LEVELS[hi])] for q in probs],
+                [g == classes.index("high") for g in gold],
+            )
+        return ev, probs
+
+    steps_per_epoch = math.ceil(len(train_rows) / args.batch)
     total = max(1, int(steps_per_epoch * args.epochs))
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=0.0
@@ -234,40 +379,39 @@ def main() -> None:
         * 0.5
         * (1 + math.cos(math.pi * min(1.0, s / total))),
     )
-
-    step, t0, run_loss = 0, time.time(), 0.0
-    history = []
+    step, t0, run_loss, history = 0, time.time(), 0.0, []
     model.train()
     epoch = 0
     while step < total:
-        for b in batches(train, args.batch, True, args.seed + epoch):
-            ids, m, p, t = collate(b, pad_id, device)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss = torch.nn.functional.cross_entropy(
-                    last_logits(model, ids, m, p, allowed), t
+        for b in batches(train_rows, args.batch, True, args.seed + epoch):
+            for k in range(0, len(b), args.micro):
+                mb = b[k : k + args.micro]
+                ids, m, p, tgt = collate(
+                    [prompt(r) for r in mb], [target(r) for r in mb], pad_id, device
                 )
-            loss.backward()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    logp = torch.log_softmax(last_logits(model, ids, m, p, allowed), -1)
+                    loss = -(tgt * logp).sum(-1).mean() * len(mb) / len(b)
+                loss.backward()
+                run_loss += loss.item()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
             step += 1
-            run_loss += loss.item()
             if step % 50 == 0:
                 print(
-                    f"step {step}/{total} loss {run_loss / 50:.4f} lr {sched.get_last_lr()[0]:.2e} {time.time() - t0:.0f}s",
+                    f"step {step}/{total} loss {run_loss / 50:.4f} "
+                    f"lr {sched.get_last_lr()[0]:.2e} {time.time() - t0:.0f}s",
                     flush=True,
                 )
                 run_loss = 0.0
-            if step % args.eval_every == 0 and val:
-                ev, _ = evaluate(
-                    model, val[:4000], args.batch, pad_id, device, allowed, classes
-                )
-                history.append(
-                    {"step": step, **{k: ev[k] for k in ("acc", "majority_baseline")}}
-                )
+            if step % args.eval_every == 0 and val_rows:
+                ev, _ = evaluate(val_rows[:1000])
+                history.append({"step": step, **{k: ev[k] for k in ("acc", "soft_ce")}})
                 print(
-                    f"  held-out acc {ev['acc']:.4f} (majority baseline {ev['majority_baseline']:.4f})",
+                    f"  held-out acc {ev['acc']:.4f} soft CE {ev['soft_ce']:.4f} "
+                    f"(majority {ev['majority_baseline']:.4f})",
                     flush=True,
                 )
             if step >= total:
@@ -276,19 +420,26 @@ def main() -> None:
 
     args.out.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(args.out))
-    ev, preds = evaluate(model, val, args.batch, pad_id, device, allowed, classes)
+    ev, probs = evaluate(val_rows)
     with open(args.out / "heldout_preds.jsonl", "w") as f:
-        for r, pr in zip(val_rows, preds):
+        for r, q in zip(val_rows, probs):
+            stream, n, state = r[0], r[1], r[2]
             f.write(
                 json.dumps(
-                    {"text": r["text"], "label": r["label"], "peft": classes[pr]}
+                    {
+                        "history_ids": stream.ids(n) if stream is not None else None,
+                        "state": state,
+                        "label": max(r[3], key=r[3].get),
+                        "peft": classes[max(range(len(q)), key=q.__getitem__)],
+                    }
                 )
                 + "\n"
             )
     metrics = {
-        "adapter": args.adapter,
+        "adapter": a,
+        "kind": args.kind,
         "args": {k: str(v) for k, v in vars(args).items()},
-        "train_examples": len(train),
+        "train_examples": len(train_rows),
         "steps": step,
         "seconds": round(time.time() - t0, 1),
         "heldout": ev,
@@ -296,8 +447,14 @@ def main() -> None:
     }
     (args.out / "metrics.json").write_text(json.dumps(metrics, indent=1))
     print(
-        f"\n{args.adapter}: held-out acc {ev['acc']:.4f} vs majority baseline {ev['majority_baseline']:.4f} "
-        f"({ev['majority_class']}); saved -> {args.out}"
+        f"\n{a} ({args.kind}): held-out acc {ev['acc']:.4f} soft CE {ev['soft_ce']:.4f} "
+        f"vs majority {ev['majority_baseline']:.4f} ({ev['majority_class']})"
+        + (
+            f"; AUC damage-in-1s {ev['auc_damage_1s']:.3f}"
+            if a == CRITIC and ev.get("auc_damage_1s")
+            else ""
+        )
+        + f"; saved -> {args.out}"
     )
 
 

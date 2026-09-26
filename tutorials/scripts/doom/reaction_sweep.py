@@ -19,7 +19,7 @@ from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from doom_env import ATTACKS, TIC_HZ, TIC_MS, DoomEnv
+from doom_env import ATTACKS, TIC_HZ, TIC_MS, DoomEnv, isolate_workdir
 from expert import PLAN_EVERY_TICS, Expert
 
 CONDS = {  # name: (decisions per second, delay in tics)
@@ -38,6 +38,7 @@ def beat(t, hz):
 
 def run(args):
     name, behavior, seed, seconds = args
+    isolate_workdir()
     hz, delay = CONDS[name]
     env, ex = (
         DoomEnv(

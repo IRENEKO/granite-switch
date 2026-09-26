@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage the demo's aLoRA adapters and compose them into one Granite Switch checkpoint.
+"""Stage the demo's adapters and compose them into one Granite Switch checkpoint.
 
 Stand-in adapters (random weights, the real shape) for the latency test, which
-does not need trained behavior::
+does not need trained behavior. ``--kind lora`` builds the same six adapters as
+plain LoRA, the baseline aLoRA is measured against::
 
     python build_model.py standin --base /path/to/granite-4.1-3b --out models/standin
+    python build_model.py standin --kind lora --base /path/to/granite-4.1-3b \
+        --out models/standin-lora
 
 Trained adapters, as written by ``train_alora.py`` to ``<runs>/<name>/``::
 
@@ -12,8 +15,13 @@ Trained adapters, as written by ``train_alora.py`` to ``<runs>/<name>/``::
         --out models/doom-switch
 
 Each adapter is staged in the library layout the composer expects,
-``<stage>/<name>/<target_model>/alora/`` with an ``io.yaml``. Then the stock
-compose CLI runs with the four local paths.
+``<stage>/<name>/<target_model>/{alora,lora}/`` with an ``io.yaml``; the
+directory name tells the composer which kind it is (aLoRA: control token before
+the assistant header; LoRA: at position 0). Then the stock compose CLI runs
+with the local paths.
+
+Adapter settings follow IBM's shipped Granite aLoRAs: rank 32 on every linear
+layer, attention and MLP.
 
 Parity of the composed checkpoint against PEFT, on each adapter's held-out
 states (``heldout_preds.jsonl`` from ``train_alora.py``); the gate is >= 99%::
@@ -37,7 +45,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from policy import ADAPTERS, alora_invocation_ids
 
-DEFAULT_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj")
+DEFAULT_TARGETS = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+DEFAULT_RANK = 32
+KINDS = ("alora", "lora")
 
 
 def io_yaml(name: str) -> dict:
@@ -52,9 +70,11 @@ def io_yaml(name: str) -> dict:
     }
 
 
-def stage(adapter_dir: Path, name: str, stage_root: Path, target_model: str) -> Path:
-    """Copy a PEFT adapter into ``<stage_root>/<name>/<target_model>/alora/``."""
-    dst = stage_root / name / target_model / "alora"
+def stage(
+    adapter_dir: Path, name: str, stage_root: Path, target_model: str, kind: str
+) -> Path:
+    """Copy a PEFT adapter into ``<stage_root>/<name>/<target_model>/<kind>/``."""
+    dst = stage_root / name / target_model / kind
     if dst.exists():
         shutil.rmtree(dst)
     dst.mkdir(parents=True)
@@ -81,23 +101,28 @@ def compose(paths: list[Path], base: str, out: Path) -> None:
 
 
 def make_standins(
-    base: str, out_dir: Path, rank: int, targets: tuple[str, ...], seed: int
+    base: str, out_dir: Path, rank: int, targets: tuple[str, ...], seed: int, kind: str
 ) -> dict[str, Path]:
-    """Write one random-weight aLoRA per adapter name (same shape as the real ones)."""
+    """Write one random-weight adapter per name (same shape as the real ones)."""
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(base)
     model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16)
+    extra = (
+        {"alora_invocation_tokens": alora_invocation_ids(tok)}
+        if kind == "alora"
+        else {}
+    )
     cfg = LoraConfig(
         task_type="CAUSAL_LM",
         r=rank,
         lora_alpha=rank,
         target_modules=list(targets),
-        alora_invocation_tokens=alora_invocation_ids(tok),
         lora_dropout=0.0,
         bias="none",
+        **extra,
     )
     peft_model = get_peft_model(model, cfg)
     gen = torch.Generator().manual_seed(seed)
@@ -110,12 +135,13 @@ def make_standins(
         d = out_dir / "peft" / name
         peft_model.save_pretrained(str(d))
         written[name] = d
-        print(f"stand-in aLoRA {name}: r={rank} targets={','.join(targets)} -> {d}")
+        print(f"stand-in {kind} {name}: r={rank} targets={','.join(targets)} -> {d}")
     return written
 
 
 def verify(runs: Path, model: str, router_runs: Path | None, limit: int) -> dict:
-    """Argmax agreement: composed checkpoint in vLLM vs the PEFT adapter."""
+    """Argmax agreement: composed checkpoint in vLLM vs the PEFT adapter, on the
+    held-out rows each adapter's training run wrote (history ids + state)."""
     from policy import ROUTER, VLLMPolicy
 
     pol = VLLMPolicy(model, warmup=5, max_num_seqs=64)
@@ -125,17 +151,16 @@ def verify(runs: Path, model: str, router_runs: Path | None, limit: int) -> dict
         path = root / name / "heldout_preds.jsonl"
         rows = [json.loads(line) for line in open(path)][:limit]
         if name == ROUTER:
-            got = [pol.route(r["text"]).adapter for r in rows]
+            got = [pol.route(r["state"]).adapter for r in rows]
         else:
             got = []
             for i in range(0, len(rows), 64):
                 chunk = rows[i : i + 64]
-                got += [
-                    d.action
-                    for d in pol.decide_batch(
-                        [r["text"] for r in chunk], [name] * len(chunk)
-                    )
-                ]
+                decs = pol.decide_games(
+                    [(r["history_ids"], r["state"]) for r in chunk],
+                    [[name]] * len(chunk),
+                )
+                got += [d[name].action for d in decs]
         agree = sum(g == r["peft"] for g, r in zip(got, rows)) / max(1, len(rows))
         acc = sum(g == r["label"] for g, r in zip(got, rows)) / max(1, len(rows))
         report[name] = {
@@ -154,8 +179,8 @@ def verify(runs: Path, model: str, router_runs: Path | None, limit: int) -> dict
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("standin", help="Random-weight aLoRAs for the latency test")
-    s.add_argument("--rank", type=int, default=16)
+    s = sub.add_parser("standin", help="Random-weight adapters for the latency test")
+    s.add_argument("--rank", type=int, default=DEFAULT_RANK)
     s.add_argument("--targets", default=",".join(DEFAULT_TARGETS))
     s.add_argument("--seed", type=int, default=0)
     c = sub.add_parser("compose", help="Compose trained adapters from train_alora.py")
@@ -166,6 +191,7 @@ def main() -> None:
         "--router-runs", type=Path, help="Where the router adapter lives if elsewhere"
     )
     for p in (s, c):
+        p.add_argument("--kind", choices=KINDS, default="alora")
         p.add_argument("--base", default="ibm-granite/granite-4.1-3b")
         p.add_argument(
             "--out", type=Path, required=True, help="Composed checkpoint dir"
@@ -188,7 +214,12 @@ def main() -> None:
     stage_root = args.out.parent / f"{args.out.name}-stage"
     if args.cmd == "standin":
         adapters = make_standins(
-            args.base, stage_root, args.rank, tuple(args.targets.split(",")), args.seed
+            args.base,
+            stage_root,
+            args.rank,
+            tuple(args.targets.split(",")),
+            args.seed,
+            args.kind,
         )
     else:
         adapters = {}
@@ -201,7 +232,9 @@ def main() -> None:
             adapters[name] = root / name
             if not (adapters[name] / "adapter_config.json").exists():
                 raise SystemExit(f"missing trained adapter: {adapters[name]}")
-    paths = [stage(d, n, stage_root, target_model) for n, d in adapters.items()]
+    paths = [
+        stage(d, n, stage_root, target_model, args.kind) for n, d in adapters.items()
+    ]
     compose(paths, args.base, args.out)
     print(f"\ncomposed {len(paths)} adapters ({', '.join(adapters)}) -> {args.out}")
 

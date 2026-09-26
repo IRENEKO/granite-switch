@@ -13,10 +13,12 @@ carries two views of the same moment:
 
 * **Player-visible** (``obs.text`` and the fields it is built from, and
   :func:`features`, the same fields as numbers): HUD values including owned
-  weapons, the enemies, items and incoming missiles currently on screen (read
-  from the labels buffer) as bearing and distance, four wall clearances, and a
-  small memory the wrapper keeps (last two actions, damage taken in the last
-  second, last-seen enemy bearing). This is all the policies read.
+  weapons, the player's map position and heading (what the automap and knowing
+  the map give a human), the enemies, items and incoming missiles currently on
+  screen (read from the labels buffer) as bearing and distance, four wall
+  clearances, and a small memory the wrapper keeps (last two actions, damage
+  taken in the last second, last-seen enemy bearing). This is all the policies
+  read.
 * **Privileged** (``obs.priv`` and :func:`priv_features`): every object in the
   level with world positions, every bot's position, the scoreboard. Only the
   scripted expert and the RL teacher's critic may use it.
@@ -39,6 +41,7 @@ from __future__ import annotations
 
 import math
 import os
+import tempfile
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -332,6 +335,16 @@ _PLAYER_HEIGHT = 56.0
 WALL_CAP_M = 9
 
 
+def isolate_workdir() -> None:
+    """Give this process its own working directory.
+
+    ViZDoom writes ``_vizdoom.ini`` and ``_vizdoom/`` into the current directory,
+    and instances starting at the same moment race to create the directory; the
+    losers exit. Call at the top of every worker process.
+    """
+    os.chdir(tempfile.mkdtemp(prefix="vizdoom-"))
+
+
 def _wrap180(deg: float) -> float:
     return (deg + 180.0) % 360.0 - 180.0
 
@@ -380,6 +393,8 @@ class Observation:
     weapon: str
     slot: int  # selected weapon slot
     arms: dict[int, int]  # owned slot -> ammo (the fist, slot 1, always owned)
+    pos: tuple[int, int]  # metres east and north of the map's south-west corner
+    face: int  # heading, whole degrees counter-clockwise from east, 0-359
     seen: list[Seen]  # the capped subset that appears in ``text``
     walls: tuple[int, int, int, int]  # l, f, r, b clearance, whole metres, capped
     hit: int  # damage taken in the last second
@@ -459,6 +474,8 @@ def serialize(
     ammo: int,
     weapon: str,
     arms: dict[int, int],
+    pos: tuple[int, int],
+    face: int,
     seen: list[Seen],
     walls: tuple[int, int, int, int],
     hit: int,
@@ -470,8 +487,8 @@ def serialize(
     owned = " ".join(f"{s}:{a}" for s, a in sorted(arms.items()) if s > 1) or "none"
     l, f, r, b = walls
     text = (
-        f"hp {hp} armor {armor} | {weapon} {ammo} | arms {owned} | see {objs} | "
-        f"wall l{l} f{f} r{r} b{b} | hit {hit}"
+        f"hp {hp} armor {armor} | at {pos[0]},{pos[1]} face {face} | {weapon} {ammo} | "
+        f"arms {owned} | see {objs} | wall l{l} f{f} r{r} b{b} | hit {hit}"
     )
     if enemy_mem is not None:
         text += f" | enemy {enemy_mem[0]:+d} {enemy_mem[1]}s"
@@ -541,6 +558,8 @@ class DoomEnv:
         self.n_bots = n_bots
         self._frame: np.ndarray | None = None
         self._segments: np.ndarray | None = None
+        self._origin: tuple[float, float] | None = None
+        self._heights: tuple | None = None
         self._segments_tick = -(10**9)
         self.stats = MatchStats()
         self.obs: Observation | None = None
@@ -688,6 +707,9 @@ class DoomEnv:
             if block:
                 segs.append((*p1, *p2))
         self._segments = np.asarray(segs, dtype=np.float64).reshape(-1, 4)
+        if self._origin is None:  # the map's south-west corner, for positions
+            s = self._segments
+            self._origin = (float(s[:, [0, 2]].min()), float(s[:, [1, 3]].min()))
 
     def _raycast(self, x: float, y: float, angles_deg: np.ndarray) -> np.ndarray:
         """Distance in map units to the nearest blocking segment along each angle."""
@@ -843,9 +865,15 @@ class DoomEnv:
         else:
             enemy_mem = None
 
-        # Wall clearances.
+        # Wall clearances. The blocking lines change only when a lift or door
+        # moves, so rebuild them only when some sector height has changed.
         if self._tick - self._segments_tick >= 10:
-            self._refresh_segments(st.sectors)
+            heights = tuple(
+                (sec.floor_height, sec.ceiling_height) for sec in st.sectors
+            )
+            if heights != self._heights:
+                self._refresh_segments(st.sectors)
+                self._heights = heights
             self._segments_tick = self._tick
         angles = np.array(
             [heading - (b + f) for _, b in WALL_PROBES for f in _PROBE_FAN]
@@ -855,13 +883,29 @@ class DoomEnv:
             float(max(0.0, d - _PLAYER_RADIUS) / UNITS_PER_M) for d in dist
         )
         walls = tuple(min(WALL_CAP_M, int(w)) for w in walls_raw)
+        pos = (
+            max(0, round((px - self._origin[0]) / UNITS_PER_M)),
+            max(0, round((py - self._origin[1]) / UNITS_PER_M)),
+        )
+        face = round(heading) % 360
 
         last = (self._last[0], self._last[1])
         if dead:
             text = "dead, respawning"
         else:
             text = serialize(
-                hp, armor, ammo, weapon, arms, seen, walls, hit, enemy_mem, last
+                hp,
+                armor,
+                ammo,
+                weapon,
+                arms,
+                pos,
+                face,
+                seen,
+                walls,
+                hit,
+                enemy_mem,
+                last,
             )
         priv = Privileged(
             px, py, heading, objects, enemies, seen_all, walls_raw, s.scoreboard
@@ -875,6 +919,8 @@ class DoomEnv:
             weapon=weapon,
             slot=slot,
             arms=arms,
+            pos=pos,
+            face=face,
             seen=seen,
             walls=walls,
             hit=hit,
@@ -909,6 +955,8 @@ def features(obs: Observation) -> np.ndarray:
     policy trained on it can be imitated by one that reads the text.
     """
     f: list[float] = [obs.hp / 100.0, obs.armor / 100.0, min(obs.ammo, 200) / 100.0]
+    r = math.radians(obs.face)
+    f += [obs.pos[0] / 80.0, obs.pos[1] / 80.0, math.sin(r), math.cos(r)]
     f += [float(obs.slot == s) for s in WEAPON_SLOTS]
     f += [float(s in obs.arms) for s in WEAPON_SLOTS]
     f += [min(obs.arms.get(s, 0), 200) / 100.0 for s in WEAPON_SLOTS]
@@ -942,6 +990,7 @@ def features(obs: Observation) -> np.ndarray:
 
 FEATURE_DIM = (
     3
+    + 4
     + 3 * len(WEAPON_SLOTS)
     + 5 * _N_ENEMY
     + 5
