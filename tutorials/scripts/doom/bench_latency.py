@@ -35,6 +35,7 @@ Examples::
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -60,6 +61,36 @@ INSTRUCTIONS = [
     "hunt them down",
 ]
 FIGHTER, CAUTIOUS = BEHAVIORS[0], BEHAVIORS[1]
+
+
+class GCTimer:
+    """Python's cyclic GC pauses (count, total and longest, by generation)."""
+
+    def __init__(self) -> None:
+        self.reset()
+        gc.callbacks.append(self._cb)
+
+    def reset(self) -> None:
+        self.pauses: dict[int, list[float]] = {0: [], 1: [], 2: []}
+        self._t0 = 0.0
+
+    def _cb(self, phase: str, info: dict) -> None:
+        if phase == "start":
+            self._t0 = time.perf_counter()
+        else:
+            self.pauses[info["generation"]].append(
+                (time.perf_counter() - self._t0) * 1000
+            )
+
+    def summary(self) -> dict:
+        return {
+            f"gen{g}": {
+                "n": len(p),
+                "total_ms": round(sum(p), 2),
+                "max_ms": round(max(p), 2) if p else 0.0,
+            }
+            for g, p in self.pauses.items()
+        }
 
 
 def pct(xs: list[float]) -> dict:
@@ -242,6 +273,7 @@ def bench_kv(pol: VLLMPolicy, trace) -> dict:
 def bench_games(pol: VLLMPolicy, trace, sizes: list[int], reps: int) -> dict:
     """N games in one step, each at its own point of the trace, fighter only."""
     snaps = [(h, s) for _, _, h, s in Replay(trace, pol.tok)]
+    gc.freeze()  # a full GC pass over thousands of snapshots is a ~25 ms pause
     rng = random.Random(0)
     out = {}
     for n in sizes:
@@ -433,13 +465,16 @@ def main() -> None:
         ("router", lambda: bench_router(pol, 200)),
         ("live", lambda: bench_live(pol, args.live_seconds, args.seed + 99)),
     ]
+    gct = GCTimer()
     for name, fn in runs:
         if name not in scen or (args.plain_base and name in ("switch", "router")):
             continue
         print(f"\n== {name}", flush=True)
         # Scenarios replay the same trace: start each from an empty prefix cache.
         pol.llm.reset_prefix_cache()
+        gct.reset()
         res[name] = fn()
+        res[name]["python_gc"] = gct.summary()
         print(json.dumps(res[name], indent=1), flush=True)
 
     for name in ("reflex", "multi"):

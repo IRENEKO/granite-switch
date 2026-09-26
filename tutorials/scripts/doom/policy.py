@@ -453,9 +453,11 @@ class VLLMPolicy:
             max_model_len=max_model_len,
             enable_prefix_caching=prefix_caching,
             max_num_seqs=max_num_seqs,
-            # Room for the LoRA baseline to re-prefill five whole prompts in one
-            # step (steps above the largest capture size run eagerly).
-            max_num_batched_tokens=8192,
+            # Every step fits a captured graph; larger prefills (the LoRA
+            # baseline re-prefilling whole prompts) are chunked across steps.
+            # Eager steps above the largest capture size also fail in vLLM
+            # 0.19.1 ("scheduler_metadata must have shape (metadata_size)").
+            max_num_batched_tokens=max(CAPTURE_SIZES),
             gpu_memory_utilization=gpu_memory_utilization,
             max_logprobs=len(ACTIONS),
             logprobs_mode=logprobs_mode,

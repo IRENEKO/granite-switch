@@ -54,6 +54,70 @@ Stage 0 measurements, on an M-series MacBook with 14 cores:
   therefore the **default bots**, the first seven of the `bots.cfg` shipped with
   ViZDoom, unchanged ([`bots.cfg`](../scripts/doom/bots.cfg)).
 
+### Stage 1: history, several adapters, and what aLoRA buys
+
+Every adapter now reads one prompt: the system prompt, a history of the last
+10 s, and the current state, then its own query suffix:
+
+```
+[system] [history: 5 Hz entries, append-only, up to ~1.3k tokens] [pad]
+[now t14.2 | current state, ~80 tokens] [pad] <|adapter|>assistant<|end_of_role|>
+```
+
+History entries ([`history.py`](../scripts/doom/history.py)) carry absolute
+match time (`t12.4 hp 64 face 135 | bot +10 8m | did cl`), so the history only
+grows and stays in the prefix cache from tic to tic. The current-state line
+starts with `now t14.2`. At 10 s the window drops its oldest half; that tic
+re-prefills about 700 tokens. The padding (newlines to the next 16-token KV
+block) leaves only the 5-token suffix as per-adapter work.
+
+The same six stand-in adapters (rank 32, every linear layer, random weights)
+are composed twice: as aLoRA, and as plain LoRA, whose control token sits at
+position 0 so each adapter has its own KV from the first token. Both run the same
+prompts: a 90 s trace of scripted play replayed with its history, including
+window resets. Results are from [`bench_latency.py`](../scripts/doom/bench_latency.py)
+on one H100 (vLLM 0.19.1, `cudagraph_mode=FULL`, capture sizes and
+`max_num_batched_tokens` up to 2048), both runs on the same node:
+
+| Per tic, ms | aLoRA | LoRA |
+|---|---:|---:|
+| Fighter only, p50 / p99 | 9.0 / 11.5 | 8.6 / 10.3 |
+| Fighter + critic every tic, planner every 0.5 s, p50 / p99 | 10.2 / 12.6 | 10.6 / 16.6 |
+| ... on window-reset tics, p99 | 19.5 | **30.8** |
+| 5 adapters every tic, p50 / p99 | 13.4 / 16.5 | 16.9 / 24.7 |
+| Behavior switch to an adapter idle for 10 s, p50 (steady: 9.7 / 8.9) | 9.9 | **19.5** |
+| 5 adapters on a history not yet cached, p50 | 25.8 | 86.4 |
+
+| KV per game (16-token blocks) | aLoRA | LoRA |
+|---|---:|---:|
+| 1 adapter | 86 | 85 |
+| 5 adapters | 90 | 425 |
+| Games that fit in the KV cache (0.5 GPU memory), 5 adapters | 226 | 48 |
+
+What this shows:
+
+- **With one adapter, aLoRA buys nothing.** LoRA is 0.4 ms faster; both prefill
+  the same ~85 fresh tokens a tic.
+- **Every extra adapter on the same state is nearly free with aLoRA.** vLLM
+  shares the history even between requests of one step (it caches blocks when it
+  allocates them): on a history no request has seen, requests 2 to 5 find about
+  1,200 of their ~1,230 prompt tokens cached. LoRA adapters each prefill their
+  own copy, so five of them on a cold history cost 3.3x as much.
+- **Switching behavior is free with aLoRA and doubles the tic with LoRA,**
+  because the LoRA adapter's own copy of the history is stale after 10 s.
+- **Memory is 5x with LoRA at 5 adapters,** so it fits a fifth of the games.
+- Both pass the latency gate with one game (p99 under the 28.6 ms tic), aLoRA
+  with margin at every tic including window resets. LoRA with three adapters
+  goes over the tic on resets.
+
+Two measurement notes. vLLM 0.19.1 fails with "scheduler_metadata must have
+shape (metadata_size)" on steps larger than the largest CUDA-graph capture
+size, which only the LoRA baseline produces. Capping `max_num_batched_tokens`
+at 2048 fixes it for both variants by chunking such prefills across steps.
+And tail latency depends on the node: two nodes shared with other jobs showed
+p90s near 20 ms for the same single-adapter run that measures 11.6 ms p90 on
+quiet nodes. Both columns above ran on the same quiet node.
+
 ## What the demo measures, and what it claims
 
 - **Decision latency** is wall clock in the game loop, from "state available" to

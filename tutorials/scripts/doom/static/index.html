@@ -126,6 +126,17 @@
   .reaction .k { font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-help); }
   .reaction .x { font-family: var(--mono); font-size: 16px; font-variant-numeric: tabular-nums; margin-top: 2px; }
 
+  .board { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .board td { padding: 3px 4px; color: var(--text-sec); border-bottom: 1px solid var(--border-sub); }
+  .board td.n { text-align: right; width: 48px; }
+  .board tr.me td { color: var(--text-pri); font-weight: 500; }
+  .board tr.me td:first-child { border-left: 3px solid var(--blue); padding-left: 6px; }
+  .danger { display: flex; height: 14px; margin: 4px 0 6px; background: var(--layer-02); }
+  .danger i { display: block; height: 100%; transition: width 80ms linear; }
+  .danger-k { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 11px; color: var(--text-sec); }
+  .hist { font-family: var(--mono); font-size: 11px; line-height: 1.45; color: var(--text-sec); white-space: pre; overflow-x: auto; max-height: 220px; }
+  .hist .now { color: var(--text-pri); }
+
   .footer { border-top: 1px solid var(--border-sub); padding: 12px 18px; font-size: 12px; color: var(--text-help); line-height: 1.5; }
 
   @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } .left { border-right: none; border-bottom: 1px solid var(--border-sub); } }
@@ -222,7 +233,7 @@
         <div class="heat-legend"><span>p</span><div class="ramp" id="heat-ramp"></div></div>
         <div class="heat-ticks"></div>
         <div class="small" style="margin-top:4px">One column per tic, newest at the right, last 10 s. Top strip: active behavior.
-          Bottom marks: tics with a fresh decision.</div>
+          Red strip: the critic's danger (P(mid) amber, P(high) red). Bottom marks: tics with a fresh decision.</div>
         <div class="small" id="shadow" style="margin-top:6px"></div>
       </div>
 
@@ -241,15 +252,30 @@
       </div>
 
       <div class="card">
-        <div class="eyebrow">Episode</div>
+        <div class="eyebrow">Critic adapter <span class="r">danger of being hit in the next second</span></div>
+        <div class="danger" id="danger"><i style="background:var(--green)"></i><i style="background:var(--amber)"></i><i style="background:var(--red)"></i></div>
+        <div class="danger-k"><span id="d-low">low –</span><span id="d-mid">mid –</span><span id="d-high">high –</span></div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">Weapon planner <span class="r" id="plan-when">every 0.5 s</span></div>
+        <div class="action-now" id="plan-now">–</div>
+        <div class="bars" id="plan-bars"></div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">Match vs 7 bots <span class="r" id="rank">–</span></div>
+        <table class="board" id="board"></table>
         <div class="kv">
           <div><span class="k">hp / armor</span><span class="x" id="hp">–</span></div>
-          <div><span class="k">frags</span><span class="x" id="kills">–</span></div>
-          <div><span class="k">pickups</span><span class="x" id="pickups">–</span></div>
           <div><span class="k">weapon</span><span class="x" id="weapon">–</span></div>
-          <div><span class="k">alive</span><span class="x" id="alive">–</span></div>
-          <div><span class="k">deaths</span><span class="x" id="deaths">–</span></div>
+          <div><span class="k">time</span><span class="x" id="alive">–</span></div>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">History the adapters share <span class="r" id="hist-n"></span></div>
+        <div class="hist" id="hist">–</div>
       </div>
     </aside>
   </div>
@@ -257,8 +283,9 @@
   <div class="footer" id="footer">
     Decision latency is wall clock in the game loop, from the state being available to the action being available: prompt build plus
     one vLLM engine step (prefill of the fresh state tokens and one output token). Frame streaming is outside that time. Switching behavior
-    changes only the control token: one checkpoint, one server, no adapter loading. The behaviors are imitation-learned from a scripted
-    teacher, which sets their skill ceiling. The Jev post does not state its hardware or model, so this is not a like-for-like comparison.
+    changes only the control token: one checkpoint, one server, no adapter loading. Every adapter (style, critic, weapon planner) reads
+    the same cached history and state; only its query suffix differs. The model reads structured state, not pixels, and vertical autoaim
+    is on, unlike the ViZDoom competition rules. The Jev post does not state its hardware or model, so this is not a like-for-like comparison.
   </div>
 </div>
 
@@ -337,7 +364,7 @@
     const allSame = m.tiles.every((t) => t.adapter === m.adapter);
     for (const c of document.querySelectorAll('[data-adapter]')) c.classList.toggle('on', allSame && c.dataset.adapter === m.adapter);
 
-    $('policy-label').textContent = m.policy === 'expert' ? 'scripted teacher · no model' : 'granite switch · vLLM';
+    $('policy-label').textContent = { expert: 'scripted player · no model', rl: 'RL teacher · no model', vllm: 'granite switch · vLLM' }[m.policy] || m.policy;
     $('tics').textContent = `${fmt(m.tics_per_s, 0)} tics/s`;
     $('tag-adapter').textContent = m.adapter; $('tag-adapter').style.borderLeft = `3px solid ${COLORS[m.adapter] || '#fff'}`;
     $('tag-mode').textContent = { '35hz': 'decides every tic', '10hz': 'decides at 10 Hz', turbo: `turbo · ${fmt(m.tics_per_s / 35, 1)}× real time` }[m.mode];
@@ -350,7 +377,7 @@
     $('last-ms').textContent = fmt(d.ms, 1);
     $('build').textContent = d.build_ms !== undefined ? `${(1000 * d.build_ms).toFixed(0)} µs` : '–';
     $('engine').textContent = d.engine_ms !== undefined ? `${fmt(d.engine_ms, 1)} ms` : '–';
-    $('toks').textContent = m.policy === 'expert' ? 'n/a' : `${d.fresh ?? '–'} / ${d.cached ?? '–'}`;
+    $('toks').textContent = m.policy !== 'vllm' ? 'n/a' : `${d.fresh ?? '–'} / ${d.cached ?? '–'}`;
 
     const pct = (ms) => `${Math.min(100, (ms / 100) * 100)}%`;
     if (L.p50 !== null) {
@@ -365,7 +392,7 @@
 
     $('action-now').innerHTML = `${m.action_label}<span class="tok">${m.action}</span>`;
     drawHeat();
-    $('agree').textContent = m.agreement !== null && m.agreement !== undefined ? `teacher agreement ${(100 * m.agreement).toFixed(0)}%` : (m.policy === 'expert' ? 'teacher driving' : '');
+    $('agree').textContent = m.agreement !== null && m.agreement !== undefined ? `teacher agreement ${(100 * m.agreement).toFixed(0)}%` : (m.policy !== 'vllm' ? 'teacher driving' : '');
     $('shadow').textContent = m.shadow_actions ? 'Same state, other behaviors: ' + Object.entries(m.shadow_actions).filter(([k]) => k !== m.adapter).map(([k, v]) => `${k} → ${LABELS[v] || v}`).join(' · ') : '';
 
     for (const mode of ['35hz', '10hz', 'turbo']) {
@@ -375,13 +402,31 @@
     }
     $('state').textContent = m.text; $('tick').textContent = `tic ${m.tick}`;
     const s = m.stats, h = m.hud;
-    $('hp').textContent = `${h.hp} / ${h.armor}`; $('kills').textContent = s.frags; $('pickups').textContent = s.pickups;
-    $('weapon').textContent = h.weapon; $('alive').textContent = `${s.seconds.toFixed(0)} s`; $('deaths').textContent = s.deaths;
+    $('hp').textContent = m.dead ? 'respawning' : `${h.hp} / ${h.armor}`;
+    $('weapon').textContent = h.weapon; $('alive').textContent = `${Math.floor(s.seconds / 60)}:${String(Math.floor(s.seconds % 60)).padStart(2, '0')}`;
+    $('rank').textContent = `rank ${s.rank} · margin ${s.margin >= 0 ? '+' : ''}${s.margin} · K/D ${s.kd}`;
+    $('board').innerHTML = (m.scoreboard || []).slice().sort((a, b) => b[1] - a[1]).map(([n, f]) =>
+      `<tr class="${n === 'AI' ? 'me' : ''}"><td>${n === 'AI' ? 'Granite' : escapeHtml(n)}</td><td class="n">${f}</td></tr>`).join('');
+    const c = m.critic || {};
+    const parts = (m.danger_levels || ['low', 'mid', 'high']).map((k) => c[k] || 0);
+    const tot = parts.reduce((a, b) => a + b, 0) || 1;
+    [...$('danger').children].forEach((el, i) => { el.style.width = `${(100 * parts[i] / tot).toFixed(1)}%`; });
+    ['low', 'mid', 'high'].forEach((k, i) => { $(`d-${k}`).textContent = `${k} ${(100 * parts[i] / tot).toFixed(0)}%`; });
+    if (m.plan) {
+      const names = m.weapon_names || {};
+      $('plan-now').innerHTML = `${names[m.plan.slot] || m.plan.slot}<span class="tok">slot ${m.plan.slot}</span>`;
+      $('plan-bars').innerHTML = Object.entries(m.plan.probs || {}).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, p]) =>
+        `<div class="bar"><span class="n">${names[k] || k} (${k})</span><span class="t"><i style="width:${(100 * p).toFixed(1)}%"></i></span><span class="p">${(100 * p).toFixed(0)}%</span></div>`).join('');
+      $('plan-when').textContent = `planned ${((m.tick - m.plan.tick) / 35).toFixed(1)} s ago · every 0.5 s`;
+    }
+    $('hist').innerHTML = (m.history || []).map((e) => escapeHtml(e.trimEnd())).join('\n') + `\n<span class="now">${escapeHtml(m.text)}</span>`;
+    $('hist').scrollTop = $('hist').scrollHeight;
+    $('hist-n').textContent = m.history_tokens ? `${m.history_tokens} tokens, prefix-cached` : `${(m.history || []).length} of the last lines`;
 
     if (gridN > 1) m.tiles.forEach((t, i) => {
       if (!tiles[i]) return;
       tiles[i].a.textContent = t.adapter; tiles[i].a.style.borderLeft = `3px solid ${COLORS[t.adapter]}`;
-      tiles[i].s.textContent = `${t.action} · ${t.frags}f ${t.deaths}d`;
+      tiles[i].s.textContent = `${t.action} · ${t.frags}f ${t.deaths}d · #${t.rank}`;
     });
   }
 
@@ -404,7 +449,7 @@
   }
   function heatInit(order, behaviors) {
     heatOrder = order; heatBehaviors = behaviors; heatCount = 0;
-    heatOff.width = WIN; heatOff.height = order.length + 2;
+    heatOff.width = WIN; heatOff.height = order.length + 3;  // + behavior, danger, decided
     heatCtx = heatOff.getContext('2d');
     heatCtx.fillStyle = '#161616'; heatCtx.fillRect(0, 0, heatOff.width, heatOff.height);
     const ramp = $('heat-ramp');
@@ -419,6 +464,9 @@
     const put = (row, rgb) => { img.data.set([...rgb, 255], row * 4); };
     put(0, BEHAVIOR_RGB[heatBehaviors[col.b]] || [244, 244, 244]);
     col.p.forEach((p, i) => put(i + 1, cmap(p)));
+    const [, pm, ph] = col.c || [0, 0, 0];
+    const AMBER = [210, 161, 6], RED = [250, 77, 86];  // P(mid) amber + P(high) red over the background
+    put(h - 2, [0, 1, 2].map((k) => Math.min(255, Math.round(22 + pm * (AMBER[k] - 22) + ph * (RED[k] - 22)))));
     put(h - 1, col.d ? [244, 244, 244] : [22, 22, 22]);
     heatCtx.putImageData(img, x, 0);
   }
@@ -428,11 +476,15 @@
     if (c.width !== w * dpr) { c.width = w * dpr; c.height = h * dpr; }
     const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
     g.imageSmoothingEnabled = false;
-    const gut = 90, n = heatOrder.length, stripH = 6, markH = 4, axisH = 14;
-    const rowH = (h - stripH - markH - axisH - 6) / n, cw = w - gut;
+    const gut = 90, n = heatOrder.length, stripH = 6, dangerH = 8, markH = 4, axisH = 14;
+    const rowH = (h - stripH - dangerH - markH - axisH - 9) / n, cw = w - gut;
     g.drawImage(heatOff, 0, 0, WIN, 1, gut, 0, cw, stripH);
     g.drawImage(heatOff, 0, 1, WIN, n, gut, stripH + 3, cw, n * rowH);
-    g.drawImage(heatOff, 0, n + 1, WIN, 1, gut, stripH + 3 + n * rowH + 3, cw, markH);
+    const yd = stripH + 3 + n * rowH + 3;
+    g.drawImage(heatOff, 0, n + 1, WIN, 1, gut, yd, cw, dangerH);
+    g.drawImage(heatOff, 0, n + 2, WIN, 1, gut, yd + dangerH + 3, cw, markH);
+    g.fillStyle = '#a8a8a8'; g.font = '10px "IBM Plex Mono", monospace'; g.textBaseline = 'middle';
+    g.fillText('danger', 0, yd + dangerH / 2);
     g.font = '10px "IBM Plex Mono", monospace'; g.textBaseline = 'middle'; g.fillStyle = '#c6c6c6';
     heatOrder.forEach((a, i) => g.fillText(LABELS[a] || a, 0, stripH + 3 + (i + 0.5) * rowH));
     g.fillStyle = '#a8a8a8'; g.textBaseline = 'bottom';
