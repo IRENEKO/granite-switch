@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Does deciding every tic beat 10 Hz, and does latency (staleness) matter, in game outcomes?
 
-The same scripted teacher plays every condition. Only two things change: when
-decisions happen (the cadence), and how old the state each decision was based
-on is (the delay, in tics). Real-time rules apply: the game never waits, and the
-current action repeats until a newer decision lands. Games are deathmatches
-against the default bots::
+The same player plays every condition: the scripted one, or an RL teacher
+checkpoint with ``--teacher``. Only two things change: when decisions happen
+(the cadence), and how old the state each decision was based on is (the delay,
+in tics). Real-time rules apply: the game never waits, and the current action
+repeats until a newer decision lands. Games are deathmatches against the
+default bots::
 
     python reaction_sweep.py --games 40 --seconds 120 --workers 12
+    python reaction_sweep.py --teacher runs/rl0/latest.pt --games 40
+
+The RL teacher's GRU was trained on every tic, so it still observes every tic
+and only its actions follow the cadence; at 10 Hz it therefore knows more than
+a player who looks only every 100 ms, which flatters the slow conditions.
 """
 
 import argparse
@@ -20,7 +26,7 @@ from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from doom_env import ATTACKS, TIC_HZ, TIC_MS, DoomEnv, isolate_workdir
-from expert import PLAN_EVERY_TICS, Expert
+from expert import PLAN_EVERY_TICS
 
 CONDS = {  # name: (decisions per second, delay in tics)
     "35 Hz, no delay (our demo, 7 ms < 1 tic)": (35, 0),
@@ -37,23 +43,35 @@ def beat(t, hz):
 
 
 def run(args):
-    name, behavior, seed, seconds = args
+    import random
+
+    from collect import Teacher
+
+    name, behavior, seed, seconds, teacher = args
     isolate_workdir()
     hz, delay = CONDS[name]
-    env, ex = (
-        DoomEnv(
-            seed=seed, resolution="640X480", hud=True, timeout_tics=seconds * TIC_HZ
-        ),
-        Expert(),
+    env = DoomEnv(
+        seed=seed, resolution="640X480", hud=True, timeout_tics=seconds * TIC_HZ
     )
+    ex, rng = Teacher(teacher), random.Random(seed)
     obs = env.reset(seed=seed)
     ex.reset()
+
+    def pick(d: dict[str, float]) -> str:
+        if not ex.soft:
+            return max(d, key=d.get)
+        return rng.choices(list(d), weights=list(d.values()))[0]
+
     pending, current = deque(), "wait"
     last_seen, appeared, reactions = -(10**9), None, []
     while not obs.done:
         t = obs.tick
+        if obs.dead:
+            obs = env.step("wait")
+            continue
+        move, wdist = ex.label(obs, behavior)  # every tic: the RL GRU follows the game
         if beat(t, hz):
-            pending.append((t + delay, ex.act(obs, behavior)))
+            pending.append((t + delay, pick(move)))
         while pending and pending[0][0] <= t:
             current = pending.popleft()[1]
         vis = any(o.kind == "enemy" for o in obs.seen)
@@ -66,7 +84,7 @@ def run(args):
         if appeared is not None and current in ATTACKS:
             reactions.append((t - appeared) * TIC_MS)
             appeared = None
-        weapon = ex.weapon(obs) if t % PLAN_EVERY_TICS == 0 else None
+        weapon = int(pick(wdist)) if t % PLAN_EVERY_TICS == 0 else None
         obs = env.step(current, weapon=weapon)
     s = env.stats.as_dict()
     env.close()
@@ -78,10 +96,14 @@ def main() -> None:
     ap.add_argument("--games", type=int, default=40, help="Games per row")
     ap.add_argument("--seconds", type=int, default=120, help="Game length")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    ap.add_argument("--teacher", default="expert", help="'expert' or an RL checkpoint")
     args = ap.parse_args()
     N = args.games
+    teacher = args.teacher
+    if teacher != "expert":
+        teacher = os.path.abspath(teacher)
     tasks = [
-        (c, b, 5000 + i, args.seconds)
+        (c, b, 5000 + i, args.seconds, teacher)
         for c in CONDS
         for b in BEHAVIORS
         for i in range(N)

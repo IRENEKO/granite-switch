@@ -10,12 +10,14 @@ time::
         --segment "stop fighting and grab health" 20 \
         --segment "collect all the loot" 20
 
-Every action in the video comes from the composed checkpoint, one token per tic.
-The panel shows the measured wall-clock time of decisions (a 1 s rolling median,
-so it is readable) against the 28.6 ms tic. The strip below the game is the full
-action distribution as a heatmap: one row per action, one column per tic,
-filling and then sliding. The game runs synchronously and the video plays at
-35 fps, so it is real game speed.
+Every action in the video comes from the composed checkpoint, one token per tic,
+and so do the critic's danger (every tic) and the weapon plan (every 0.5 s): all
+three adapters read the same history in one engine step. The panel shows the
+measured wall-clock time of those steps (a 1 s rolling median, so it is
+readable) against the 28.6 ms tic. The strip below the game is the full action
+distribution as a heatmap, one row per action and one column per tic, filling
+and then sliding, with the critic's danger under it. The game runs synchronously
+and the video plays at 35 fps, so it is real game speed.
 
 ``--policy expert`` records the scripted teacher instead (no GPU needed; its
 distribution is one-hot), which is how the layout is checked on a laptop.
@@ -40,10 +42,12 @@ from doom_env import (
     SHORT_LABELS,
     TIC_HZ,
     TIC_MS,
+    WEAPON_NAMES,
     DoomEnv,
 )
-from expert import BEHAVIORS, PLAN_EVERY_TICS, Expert
-from policy import make_policy
+from expert import BEHAVIORS, PLAN_EVERY_TICS
+from history import History
+from policy import ARMS, CRITIC, DANGER_LEVELS, make_policy
 
 W_GAME, H = 640, 480
 W_PANEL = 360
@@ -56,10 +60,12 @@ HELP = (168, 168, 168)
 BLUE = (15, 98, 254)
 TEAL = (8, 189, 186)
 AMBER = (210, 161, 6)
-COLORS = {"fighter": (250, 77, 86), "cautious": TEAL, "collector": AMBER}
+RED = (250, 77, 86)
+GREEN = (66, 190, 101)
+COLORS = {"fighter": RED, "cautious": TEAL, "collector": AMBER}
 
 HEAT_ROW = 10  # pixels per action row
-H_HEAT = 70 + HEAT_ROW * len(DISPLAY_ORDER)  # heatmap strip under the game and panel
+H_HEAT = 82 + HEAT_ROW * len(DISPLAY_ORDER)  # heatmap strip under the game and panel
 HEAT_PX = 3  # pixels per tic
 HEAT_GUTTER = 100  # row labels
 # Colour position is sqrt(p), so runner-up actions at a few percent stay visible.
@@ -153,36 +159,58 @@ class Panel:
         d.text((x + bw - 50, y + 13), "100 ms", font=self.f_small, fill=HELP)
         y += 36
 
-        # Action + top-3
+        # Action (the full distribution is in the heatmap below)
         d.text((x, y), "ACTION", font=self.f_small, fill=HELP)
         y += 16
         d.text(
             (x, y), ACTION_LABELS.get(t["action"], t["action"]), font=self.f, fill=TEXT
         )
         d.text((x + 200, y + 2), t["action"], font=self.f_mono, fill=HELP)
-        y += 22
-        d.text(
-            (x, y),
-            "full distribution in the heatmap below",
-            font=self.f_small,
-            fill=HELP,
-        )
         y += 26
 
-        # Stats
-        d.text((x, y), "MATCH", font=self.f_small, fill=HELP)
+        # Critic: danger of being hit in the next second
+        d.text((x, y), "CRITIC  ·  DANGER NEXT SECOND", font=self.f_small, fill=HELP)
         y += 16
-        s = t["stats"]
+        crit = [t["critic"].get(k, 0.0) for k in DANGER_LEVELS]
+        tot = sum(crit) or 1.0
+        x1 = x
+        for p_, col in zip(crit, (GREEN, AMBER, RED)):
+            x2 = x1 + int(bw * p_ / tot)
+            if x2 > x1:
+                d.rectangle([x1, y, x2, y + 10], fill=col)
+            x1 = x2
+        y += 14
         d.text(
             (x, y),
-            f"hp {t['hp']}  armor {t['armor']}  {t['weapon']}",
+            "   ".join(
+                f"{k} {100 * c / tot:.0f}%" for k, c in zip(DANGER_LEVELS, crit)
+            ),
             font=self.f_small,
             fill=TEXT2,
         )
+        y += 22
+
+        # Weapon planner and match
+        plan = t.get("plan")
+        d.text((x, y), "WEAPON PLANNER  ·  EVERY 0.5 s", font=self.f_small, fill=HELP)
+        y += 16
+        if plan:
+            p_ = plan["probs"].get(str(plan["slot"]), 0.0)
+            d.text(
+                (x, y),
+                f"{WEAPON_NAMES[plan['slot']]} (slot {plan['slot']}, {100 * p_:.0f}%)"
+                f"   holding {t['weapon']}",
+                font=self.f_small,
+                fill=TEXT2,
+            )
+        y += 22
+        s = t["stats"]
+        d.text((x, y), "MATCH VS 7 BOTS", font=self.f_small, fill=HELP)
         y += 16
         d.text(
             (x, y),
-            f"frags {s['frags']}  deaths {s['deaths']}  best bot {s['best_bot'][1]}",
+            f"hp {t['hp']}  frags {s['frags']}  deaths {s['deaths']}  "
+            f"rank {s['rank']}  best bot {s['best_bot'][1]}",
             font=self.f_small,
             fill=TEXT2,
         )
@@ -223,16 +251,22 @@ class Heatmap:
 
     def __init__(self, width: int):
         self.win = (width - HEAT_GUTTER - 18) // HEAT_PX
-        self.buf = np.empty((len(DISPLAY_ORDER) + 2, self.win, 3), np.uint8)
+        # rows: behavior, the actions, danger, fresh-decision mark
+        self.buf = np.empty((len(DISPLAY_ORDER) + 3, self.win, 3), np.uint8)
         self.buf[:] = BG
         self.count = 0
         self.f = font(10, mono=True)
         self.f_small = font(11)
 
-    def push(self, probs: dict[str, float], adapter: str, decided: bool) -> None:
+    def push(
+        self, probs: dict[str, float], adapter: str, decided: bool, critic: dict
+    ) -> None:
         col = np.empty((self.buf.shape[0], 3), np.uint8)
         col[0] = COLORS.get(adapter, TEXT)
-        col[1:-1] = cmap(np.array([probs.get(a, 0.0) for a in DISPLAY_ORDER]))
+        col[1:-2] = cmap(np.array([probs.get(a, 0.0) for a in DISPLAY_ORDER]))
+        pm, ph = critic.get("mid", 0.0), critic.get("high", 0.0)
+        bg, am, rd = np.array(BG), np.array(AMBER), np.array(RED)
+        col[-2] = np.clip(bg + pm * (am - bg) + ph * (rd - bg), 0, 255)
         col[-1] = TEXT if decided else BG
         if self.count < self.win:
             self.buf[:, self.count] = col
@@ -248,7 +282,7 @@ class Heatmap:
         d.text(
             (170, y0 + 8),
             "one column per tic, newest at the right  ·  top strip: active behavior  "
-            "·  bottom marks: fresh decisions",
+            "·  danger: critic P(mid) amber, P(high) red  ·  marks: fresh decisions",
             font=self.f_small,
             fill=HELP,
         )
@@ -258,13 +292,15 @@ class Heatmap:
         rows += [
             np.repeat(self.buf[i : i + 1], HEAT_ROW, axis=0) for i in range(1, n + 1)
         ]
-        rows += [gap, np.repeat(self.buf[n + 1 : n + 2], 4, axis=0)]
+        rows += [gap, np.repeat(self.buf[n + 1 : n + 2], 8, axis=0)]
+        rows += [gap, np.repeat(self.buf[n + 2 : n + 3], 4, axis=0)]
         arr = np.repeat(np.concatenate(rows, axis=0), HEAT_PX, axis=1)
         top = y0 + 28
         img.paste(Image.fromarray(arr), (HEAT_GUTTER, top))
         for i, a in enumerate(DISPLAY_ORDER):
             y = top + 9 + HEAT_ROW * i - 1
             d.text((18, y), SHORT_LABELS[a], font=self.f, fill=TEXT2)
+        d.text((18, top + 9 + HEAT_ROW * n + 3), "danger", font=self.f, fill=HELP)
         yb = top + arr.shape[0] + 4
         d.text(
             (HEAT_GUTTER, yb),
@@ -311,7 +347,7 @@ def main() -> None:
         pol = make_policy("expert")
     env = DoomEnv(seed=args.seed, resolution="640X480", hud=True, timeout_tics=10**7)
     obs = env.reset(seed=args.seed)
-    planner = Expert()  # the weapon planner, until the arms adapter drives it
+    hist = History(getattr(pol, "tok", None))
     panel = Panel()
     heat = Heatmap(W_GAME + W_PANEL)
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -335,23 +371,32 @@ def main() -> None:
                 "route_ms": r.ms,
             }
         print(f"segment: {what!r} -> {adapter} for {secs}s", flush=True)
-        action = "wait"
+        action, critic, plan = "wait", {}, None
         for _ in range(int(float(secs) * TIC_HZ)):
+            weapon = None
             if obs.dead:  # respawning: nothing to decide
-                heat.push({}, adapter, decided=False)
+                heat.push({}, adapter, False, critic)
             else:
-                d = pol.decide(obs, adapter)
-                action = d.action
-                heat.push(d.probs, adapter, decided=True)
+                want = [adapter, CRITIC]
+                if obs.tick % PLAN_EVERY_TICS == 0:
+                    want.append(ARMS)
+                decs = pol.decide_many(obs, tuple(want), hist)
+                d = decs[adapter]
+                action, critic = d.action, decs[CRITIC].probs
+                if ARMS in decs:
+                    weapon = int(decs[ARMS].action)
+                    plan = {"slot": weapon, "probs": decs[ARMS].probs}
+                heat.push(d.probs, adapter, True, critic)
                 last_second.append(d.ms)
                 lat.append(d.ms)
                 all_ms.append(d.ms)
             frame = env.frame()
             text, hud = obs.text, (obs.hp, obs.armor, obs.weapon)
-            weapon = planner.weapon(obs) if obs.tick % PLAN_EVERY_TICS == 0 else None
+            hist.observe(obs, action)
             obs = env.step(action, weapon=weapon)
             if obs.done:
                 obs = env.reset()
+                hist.reset()
             img = Image.new("RGB", (W_GAME + W_PANEL, H + H_HEAT), BG)
             img.paste(Image.fromarray(frame), (0, 0))
             a = np.fromiter(lat, dtype=np.float64)
@@ -364,6 +409,8 @@ def main() -> None:
                     "p50": float(np.percentile(a, 50)),
                     "p99": float(np.percentile(a, 99)),
                     "action": action,
+                    "critic": critic,
+                    "plan": plan,
                     "stats": env.stats.as_dict(),
                     "hp": hud[0],
                     "armor": hud[1],

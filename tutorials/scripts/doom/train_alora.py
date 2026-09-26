@@ -431,6 +431,7 @@ def main() -> None:
                         "state": state,
                         "label": max(r[3], key=r[3].get),
                         "peft": classes[max(range(len(q)), key=q.__getitem__)],
+                        "peft_probs": {c: round(x, 5) for c, x in zip(classes, q)},
                     }
                 )
                 + "\n"

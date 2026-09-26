@@ -55,6 +55,7 @@ DEFAULT_TARGETS = (
     "down_proj",
 )
 DEFAULT_RANK = 32
+MARGIN = 0.05  # verify: PEFT top-1 minus top-2 probability for a "clear" state
 KINDS = ("alora", "lora")
 
 
@@ -151,9 +152,10 @@ def verify(runs: Path, model: str, router_runs: Path | None, limit: int) -> dict
         path = root / name / "heldout_preds.jsonl"
         rows = [json.loads(line) for line in open(path)][:limit]
         if name == ROUTER:
-            got = [pol.route(r["state"]).adapter for r in rows]
+            routes = [pol.route(r["state"]) for r in rows]
+            got, dists = [x.adapter for x in routes], [x.probs for x in routes]
         else:
-            got = []
+            got, dists = [], []
             for i in range(0, len(rows), 64):
                 chunk = rows[i : i + 64]
                 decs = pol.decide_games(
@@ -161,16 +163,42 @@ def verify(runs: Path, model: str, router_runs: Path | None, limit: int) -> dict
                     [[name]] * len(chunk),
                 )
                 got += [d[name].action for d in decs]
+                dists += [d[name].probs for d in decs]
         agree = sum(g == r["peft"] for g, r in zip(got, rows)) / max(1, len(rows))
         acc = sum(g == r["label"] for g, r in zip(got, rows)) / max(1, len(rows))
-        report[name] = {
+        rep = {
             "n": len(rows),
             "agree_with_peft": round(agree, 4),
             "acc_vs_label": round(acc, 4),
         }
+        if rows and "peft_probs" in rows[0]:
+            # Disagreements between two bf16 implementations should sit on
+            # near-ties; the distance between whole distributions says more.
+            tv, clear = [], []
+            for g, r, q in zip(got, rows, dists):
+                p = r["peft_probs"]
+                tv.append(0.5 * sum(abs(p[c] - q.get(c, 0.0)) for c in p))
+                top = sorted(p.values(), reverse=True)
+                if len(top) < 2 or top[0] - top[1] >= MARGIN:
+                    clear.append(g == r["peft"])
+            rep["mean_tv_distance"] = round(sum(tv) / len(tv), 4)
+            rep["agree_when_peft_margin_ge"] = {
+                "margin": MARGIN,
+                "n": len(clear),
+                "agree": round(sum(clear) / max(1, len(clear)), 4),
+            }
+        report[name] = rep
+        extra = ""
+        if "mean_tv_distance" in rep:
+            c = rep["agree_when_peft_margin_ge"]
+            extra = (
+                f"  mean TV {rep['mean_tv_distance']:.4f}  "
+                f"agree at margin>={MARGIN} {100 * c['agree']:6.2f}% (n={c['n']})"
+            )
         print(
             f"{name:<10} n={len(rows):>5}  composed==PEFT {100 * agree:6.2f}%  "
-            f"accuracy vs label {100 * acc:6.2f}%  {'PASS' if agree >= 0.99 else 'FAIL'}",
+            f"accuracy vs label {100 * acc:6.2f}%  {'PASS' if agree >= 0.99 else 'FAIL'}"
+            + extra,
             flush=True,
         )
     return report
