@@ -110,7 +110,49 @@ What this shows:
   with margin at every tic including window resets. LoRA with three adapters
   goes over the tic on resets.
 
-Two measurement notes. vLLM 0.19.1 fails with "scheduler_metadata must have
+### Stage 2: an RL teacher that beats the bots
+
+[`rl_teacher.py`](../scripts/doom/rl_teacher.py) is PPO with a GRU (CleanRL
+style, written for this demo rather than taken from Sample Factory, whose PyPI
+release pins `gymnasium<1.0`). Its design:
+
+- **Inputs.** The actor reads the same player-visible fields as the model's
+  text, as numbers. The critic also sees every bot's position and the frag race.
+- **Outputs.** It picks one of the 20 actions every tic, and a weapon slot every
+  0.5 s.
+- **Reward.** Sample Factory's deathmatch shaping, reweighted per style: cautious
+  pays more for deaths and damage taken, collector for pickups.
+- **Kickstarting.** Early on, a cross-entropy term pulls it toward the scripted
+  player. Its weight decays to zero at 40M steps.
+- **Throughput.** 160 envs in 40 worker processes run at 160x120, which sees the
+  same objects as 640x480. That is about 10k steps/s on one H100 with 48 cores.
+
+Evaluation uses ten-minute matches against the default bots, with the teacher
+sampling from its distribution:
+
+| Steps | Matches | Frags | Deaths | Best bot | Top frag count |
+|---:|---:|---:|---:|---:|---:|
+| 10M | 6 | 19.8 | 4.7 | 33.7 | 1 of 6 |
+| 20M | 6 | 21.8 | 7.7 | 33.0 | 0 of 6 |
+| 30M | 6 | 27.8 | 6.2 | 34.3 | 2 of 6 |
+| 41M | 12 | 43.0 ± 8.3 | 10.2 | 29.8 | 9 of 12 |
+| **51M** | **12** | **92.8 ± 7.7** | **19.2** | **27.8** | **12 of 12** |
+
+Kickstarting holds it near the scripted player until the imitation term fades.
+Within 10M steps after that it triples its frags: the scripted fighter gets 23.4
+per match, this teacher 92.8. Playing its most likely action instead of sampling
+gives 84.5 ± 35.8 frags, top in 11 of 12, so the students sample too.
+
+The styles separate in the intended directions (51M steps, 6 matches each for
+cautious and collector):
+
+| Style | Frags | Deaths | Pickups/min |
+|---|---:|---:|---:|
+| fighter | 92.8 | 19.2 | 16.1 |
+| cautious | 84.0 | **14.8** | 18.0 |
+| collector | 84.2 | 17.0 | **21.2** |
+
+Two measurement notes on stage 1. vLLM 0.19.1 fails with "scheduler_metadata must have
 shape (metadata_size)" on steps larger than the largest CUDA-graph capture
 size, which only the LoRA baseline produces. Capping `max_num_batched_tokens`
 at 2048 fixes it for both variants by chunking such prefills across steps.

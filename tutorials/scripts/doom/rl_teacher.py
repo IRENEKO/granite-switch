@@ -474,14 +474,16 @@ def play_match(args: tuple) -> dict:
         "ep": seed,
         "seed": seed,
         "bots": bots,
-        "policy": f"rl:{Path(ckpt).name}",
+        "policy": f"rl:{Path(ckpt).name}:{'sample' if sample else 'argmax'}",
         **env.stats.as_dict(),
     }
 
 
-def eval_tasks(ckpt, matches: int, styles, bots: str, seconds: float, seed: int):
+def eval_tasks(
+    ckpt, matches: int, styles, bots: str, seconds: float, seed: int, sample=True
+):
     return [
-        (str(ckpt), seed + i, st, bots, seconds, True)
+        (str(ckpt), seed + i, st, bots, seconds, sample)
         for st in styles
         for i in range(matches)
     ]
@@ -753,6 +755,11 @@ def main() -> None:
     e.add_argument("--seconds", type=float, default=MATCH_TICS / TIC_HZ)
     e.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     e.add_argument("--seed", type=int, default=5000)
+    e.add_argument(
+        "--argmax",
+        action="store_true",
+        help="Play the most likely action, not a sample",
+    )
     e.add_argument("--out", type=Path)
     args = ap.parse_args()
 
@@ -787,7 +794,13 @@ def main() -> None:
 
     args.ckpt = str(Path(args.ckpt).resolve())
     tasks = eval_tasks(
-        args.ckpt, args.matches, args.styles, args.bots, args.seconds, args.seed
+        args.ckpt,
+        args.matches,
+        args.styles,
+        args.bots,
+        args.seconds,
+        args.seed,
+        sample=not args.argmax,
     )
     with mp.get_context("spawn").Pool(args.workers) as pool:
         rows = []

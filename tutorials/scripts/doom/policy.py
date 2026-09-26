@@ -421,6 +421,10 @@ class VLLMPolicy:
         base_model: ``model`` is a plain base checkpoint without control tokens;
             every adapter then maps to the base prompt (the SWITCH-overhead
             baseline).
+        temperature: Sampling temperature for the style adapters and the
+            weapon planner (0 = greedy). Students of a stochastic RL teacher
+            play better sampling, as the teacher does; the critic and router
+            stay greedy.
     """
 
     name = "vllm"
@@ -443,6 +447,7 @@ class VLLMPolicy:
         gc_freeze: bool = True,
         async_scheduling: bool | None = None,
         log_stats: bool = False,
+        temperature: float = 0.0,
     ):
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         from vllm import LLM, SamplingParams
@@ -485,10 +490,11 @@ class VLLMPolicy:
         )
         self.vocab = {a: vocab_ids(self.tok, a) for a in ADAPTERS}
         self.words = {a: {i: w for w, i in v.items()} for a, v in self.vocab.items()}
+        self.temperature = temperature
         self.sp = {
             a: SamplingParams(
                 max_tokens=1,
-                temperature=0.0,
+                temperature=temperature if a in (*BEHAVIORS, ARMS) else 0.0,
                 allowed_token_ids=list(v.values()),
                 logprobs=len(v),  # the full distribution, for the heatmap
             )

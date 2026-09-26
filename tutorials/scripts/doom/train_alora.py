@@ -215,11 +215,13 @@ def main() -> None:
     ap.add_argument("--base", default="ibm-granite/granite-4.1-3b")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--rank", type=int, default=32)
-    ap.add_argument("--alpha", type=float, default=64.0)
+    # alpha = rank (scale 1) and lr 1e-4: at alpha 64 / lr 2e-4 a rank-32
+    # all-linear adapter collapsed to the label marginal mid-run.
+    ap.add_argument("--alpha", type=float, default=32.0)
     ap.add_argument("--targets", default=DEFAULT_TARGETS)
     ap.add_argument("--dropout", type=float, default=0.05)
     ap.add_argument("--epochs", type=float, default=1.0)
-    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--micro", type=int, default=8, help="Micro-batch (memory)")
     ap.add_argument("--every", type=int, default=3, help="Keep every k-th tic")

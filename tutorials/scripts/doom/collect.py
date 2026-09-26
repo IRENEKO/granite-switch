@@ -417,6 +417,9 @@ def main() -> None:
     )
     ap.add_argument("--model", help="Composed checkpoint (for --policy vllm)")
     ap.add_argument(
+        "--temperature", type=float, default=0.0, help="Student sampling (vllm)"
+    )
+    ap.add_argument(
         "--behaviors", nargs="+", default=list(BEHAVIORS), choices=BEHAVIORS
     )
     ap.add_argument("--episodes", type=int, default=50, help="Per behavior")
@@ -508,7 +511,10 @@ def main() -> None:
             from policy import VLLMPolicy
 
             pol = VLLMPolicy(
-                args.model, max_num_seqs=max(16, 2 * args.workers), warmup=5
+                args.model,
+                max_num_seqs=max(16, 2 * args.workers),
+                warmup=5,
+                temperature=args.temperature,
             )
             batch = _StudentBatch(pol)
         else:
