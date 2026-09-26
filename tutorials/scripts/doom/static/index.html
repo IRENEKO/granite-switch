@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Granite Switch · Doom reflex demo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* Carbon g100 tokens, inlined from design/carbon-embed-starter.html. */
+  :root {
+    --bg: #161616; --layer-01: #262626; --layer-02: #393939;
+    --border-sub: #393939; --border-str: #6f6f6f;
+    --text-pri: #f4f4f4; --text-sec: #c6c6c6; --text-help: #a8a8a8; --text-place: #6f6f6f;
+    --blue: #0f62fe; --blue-hover: #0353e9; --blue-light: #78a9ff; --cyan: #33b1ff;
+    --magenta: #ff7eb6; --teal: #08bdba; --green: #42be65; --red: #fa4d56; --amber: #d2a106;
+    --focus: #ffffff;
+    --dur-fast: 110ms; --ease-prod: cubic-bezier(0.2, 0, 0.38, 0.9);
+    --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
+  html, body { background: #0b0b0b; color: var(--text-pri); font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased; min-height: 100vh; }
+  ::selection { background: var(--blue); color: #fff; }
+
+  .app { max-width: 1440px; margin: 0 auto; border: 1px solid var(--border-sub); background: var(--bg); min-height: 100vh;
+    display: flex; flex-direction: column; }
+  .header { height: 48px; border-bottom: 1px solid var(--border-sub); display: flex; align-items: center; padding: 0 18px; gap: 16px; }
+  .ibm-bars { display: inline-flex; flex-direction: column; gap: 2px; }
+  .ibm-bars span { width: 22px; height: 1.5px; background: var(--text-pri); display: block; }
+  .header-label { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-sec); }
+  .header-label .sep { color: var(--text-place); margin: 0 8px; }
+  .spacer { flex: 1; }
+  .status { font-family: var(--mono); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-help); display: flex; gap: 14px; }
+  .status .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--text-place); margin-right: 6px; vertical-align: 1px; }
+  .status .dot.live { background: var(--green); }
+
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 400px; flex: 1; min-height: 0; }
+  .left { padding: 18px; display: flex; flex-direction: column; gap: 14px; border-right: 1px solid var(--border-sub); min-width: 0; }
+  .right { padding: 18px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
+
+  .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-help);
+    display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .eyebrow::before { content: ''; width: 6px; height: 6px; background: var(--blue); flex-shrink: 0; }
+  .eyebrow .r { margin-left: auto; color: var(--text-sec); letter-spacing: .04em; text-transform: none; }
+
+  .screen-wrap { position: relative; background: var(--layer-01); aspect-ratio: 4 / 3; width: 100%; max-height: calc(100vh - 290px); overflow: hidden; }
+  .screen-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; image-rendering: auto; }
+  .tag { position: absolute; top: 8px; left: 10px; font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--text-pri); background: rgba(22,22,22,.72); padding: 3px 7px; z-index: 2; pointer-events: none; }
+  .tag-r { left: auto; right: 10px; font-variant-numeric: tabular-nums; }
+  .tag-b { top: auto; bottom: 8px; }
+  .grid { position: absolute; inset: 0; display: grid; gap: 2px; background: var(--bg); }
+  .tile { position: relative; background: var(--layer-01); overflow: hidden; }
+  .tile canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .tile .tag { font-size: 9px; padding: 2px 5px; top: 4px; left: 4px; }
+  .tile .tag-r { left: auto; right: 4px; }
+
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .field { flex: 1; min-width: 240px; height: 40px; background: var(--layer-01); border: none; border-bottom: 1px solid var(--border-str);
+    color: var(--text-pri); font: inherit; font-size: 14px; padding: 0 14px; outline: none; }
+  .field:focus { outline: 2px solid var(--focus); outline-offset: -2px; }
+  .field::placeholder { color: var(--text-place); }
+  .btn { height: 40px; padding: 0 16px; border: 1px solid var(--blue); background: transparent; color: var(--blue-light);
+    font: inherit; font-size: 13px; cursor: pointer; letter-spacing: .02em; white-space: nowrap;
+    transition: background var(--dur-fast) var(--ease-prod), color var(--dur-fast) var(--ease-prod); }
+  .btn:hover { background: var(--blue); color: #fff; }
+  .btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .btn-primary { background: var(--blue); color: #fff; }
+  .btn-primary:hover { background: var(--blue-hover); }
+  .seg { display: inline-flex; border: 1px solid var(--border-str); }
+  .seg button { height: 32px; padding: 0 12px; background: transparent; border: none; border-right: 1px solid var(--border-str);
+    color: var(--text-sec); font-family: var(--mono); font-size: 12px; cursor: pointer; }
+  .seg button:last-child { border-right: none; }
+  .seg button.on { background: var(--text-pri); color: var(--bg); }
+  .seg button:hover:not(.on) { background: var(--layer-02); }
+  .seg-label { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-help); margin-right: 4px; }
+  .chip { height: 32px; padding: 0 14px; border-radius: 16px; background: var(--layer-02); border: 1px solid transparent; color: var(--text-sec);
+    font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; }
+  .chip .sw { width: 8px; height: 8px; border-radius: 50%; }
+  .chip.on { border-color: var(--text-pri); color: var(--text-pri); }
+  .route { font-size: 13px; color: var(--text-sec); min-height: 18px; }
+  .route b { color: var(--text-pri); font-weight: 500; }
+  .route .m { font-family: var(--mono); color: var(--text-help); }
+
+  .card { background: var(--layer-01); padding: 14px 16px; }
+  .big { display: flex; align-items: baseline; gap: 10px; }
+  .big .v { font-size: 44px; font-weight: 300; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .big .u { font-size: 16px; color: var(--text-sec); }
+  .kv { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+  .kv div { display: flex; flex-direction: column; gap: 2px; }
+  .kv .k { font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-help); }
+  .kv .x { font-family: var(--mono); font-size: 15px; font-variant-numeric: tabular-nums; }
+
+  .budget { position: relative; height: 34px; margin-top: 4px; }
+  .budget .track { position: absolute; left: 0; right: 0; top: 10px; height: 14px; background: var(--layer-02); }
+  .budget .fill { position: absolute; left: 0; top: 10px; height: 14px; background: var(--teal); transition: width 120ms linear; }
+  .budget .p99 { position: absolute; top: 6px; width: 2px; height: 22px; background: var(--amber); }
+  .budget .mark { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--text-pri); }
+  .budget .mark span { position: absolute; top: -2px; left: 4px; font-family: var(--mono); font-size: 10px; color: var(--text-sec); white-space: nowrap; }
+  .budget-note { font-size: 12px; color: var(--text-sec); margin-top: 6px; }
+  .budget-note b { color: var(--text-pri); font-weight: 500; }
+
+  canvas.spark { width: 100%; height: 70px; display: block; }
+
+  .bars { display: flex; flex-direction: column; gap: 6px; }
+  .bar { display: grid; grid-template-columns: 120px 1fr 48px; gap: 8px; align-items: center; font-size: 13px; }
+  .bar .n { color: var(--text-sec); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bar .t { height: 8px; background: var(--layer-02); position: relative; }
+  .bar .t i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--blue); }
+  .bar .p { font-family: var(--mono); font-size: 12px; text-align: right; color: var(--text-sec); font-variant-numeric: tabular-nums; }
+  .action-now { font-size: 22px; font-weight: 300; margin-bottom: 8px; }
+  .action-now .tok { font-family: var(--mono); font-size: 13px; color: var(--text-help); margin-left: 8px; }
+
+  .mono { font-family: var(--mono); font-size: 12px; line-height: 1.5; color: var(--text-sec); word-break: break-word; }
+  .small { font-size: 12px; color: var(--text-help); line-height: 1.45; }
+  .reaction { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .reaction div { background: var(--layer-02); padding: 8px 10px; }
+  .reaction .k { font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-help); }
+  .reaction .x { font-family: var(--mono); font-size: 16px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+
+  .footer { border-top: 1px solid var(--border-sub); padding: 12px 18px; font-size: 12px; color: var(--text-help); line-height: 1.5; }
+
+  @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } .left { border-right: none; border-bottom: 1px solid var(--border-sub); } }
+  @media (prefers-reduced-motion: reduce) { .budget .fill, .btn { transition: none; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <span class="ibm-bars" aria-label="IBM"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></span>
+    <span class="header-label">Granite Switch<span class="sep">/</span>Doom reflex demo</span>
+    <span class="spacer"></span>
+    <span class="status"><span><span class="dot" id="live-dot"></span><span id="conn">connecting</span></span><span id="policy-label">–</span><span id="tics">– tics/s</span></span>
+  </div>
+
+  <div class="layout">
+    <section class="left">
+      <div class="screen-wrap" id="screen-wrap">
+        <canvas id="screen" width="640" height="480" aria-label="Game view"></canvas>
+        <div class="grid" id="grid" hidden></div>
+        <span class="tag" id="tag-adapter">–</span>
+        <span class="tag tag-r" id="tag-mode">–</span>
+        <span class="tag tag-b" id="tag-action">–</span>
+      </div>
+
+      <div class="row">
+        <input class="field" id="instr" placeholder="Tell Granite how to play, e.g. “stop fighting and grab health”" autocomplete="off" />
+        <button class="btn btn-primary" id="send">Send</button>
+      </div>
+      <div class="route" id="route">The router adapter maps your instruction to a behavior with one output token.</div>
+
+      <div class="row">
+        <span class="seg-label">Behavior</span>
+        <button class="chip" data-adapter="hunter"><span class="sw" style="background:var(--red)"></span>hunter</button>
+        <button class="chip" data-adapter="survivor"><span class="sw" style="background:var(--teal)"></span>survivor</button>
+        <button class="chip" data-adapter="scavenger"><span class="sw" style="background:var(--amber)"></span>scavenger</button>
+        <button class="chip" id="mix" hidden>mix</button>
+      </div>
+      <div class="row">
+        <span class="seg-label">Cadence</span>
+        <span class="seg" id="mode-seg">
+          <button data-mode="35hz">every tic · 35 Hz</button>
+          <button data-mode="10hz">10 Hz</button>
+          <button data-mode="turbo">turbo</button>
+        </span>
+        <span class="seg-label" style="margin-left:12px">Games</span>
+        <span class="seg" id="grid-seg">
+          <button data-grid="1">1</button><button data-grid="4">4</button><button data-grid="9">9</button><button data-grid="16">16</button>
+        </span>
+        <span class="seg-label" style="margin-left:12px">Shadow</span>
+        <span class="seg" id="shadow-seg"><button data-shadow="0">off</button><button data-shadow="1">on</button></span>
+        <span class="spacer"></span>
+        <button class="btn" id="restart">Restart</button>
+      </div>
+    </section>
+
+    <aside class="right">
+      <div class="card">
+        <div class="eyebrow">Decision latency <span class="r" id="lat-n"></span></div>
+        <div class="big"><span class="v" id="p50">–</span><span class="u">ms p50</span></div>
+        <div class="kv">
+          <div><span class="k">p99</span><span class="x" id="p99">–</span></div>
+          <div><span class="k">decisions/s</span><span class="x" id="dps">–</span></div>
+          <div><span class="k">last</span><span class="x" id="last-ms">–</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">Tic budget</div>
+        <div class="budget" id="budget">
+          <div class="track"></div>
+          <div class="fill" id="budget-fill" style="width:0"></div>
+          <div class="p99" id="budget-p99" style="left:0"></div>
+          <div class="mark" style="left:28.57%"><span>1 tic · 28.6 ms</span></div>
+          <div class="mark" style="left:99.6%"><span style="left:auto;right:4px">~100 ms</span></div>
+        </div>
+        <div class="budget-note" id="budget-note">Scale 0–100 ms. A Doom tic is 28.6 ms; the Jev post describes about 10 decisions per second (~100 ms each).</div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">Last decisions <span class="r">ms · line = 1 tic</span></div>
+        <canvas class="spark" id="spark"></canvas>
+        <div class="kv">
+          <div><span class="k">prompt build</span><span class="x" id="build">–</span></div>
+          <div><span class="k">engine step</span><span class="x" id="engine">–</span></div>
+          <div><span class="k">fresh / cached</span><span class="x" id="toks">–</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">Action <span class="r" id="agree"></span></div>
+        <div class="action-now" id="action-now">–</div>
+        <div class="bars" id="bars"></div>
+        <div class="small" id="shadow" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">Reaction time <span class="r">hunter · monster on screen → first shot</span></div>
+        <div class="reaction">
+          <div><div class="k">every tic</div><div class="x" id="rt-35hz">–</div></div>
+          <div><div class="k">10 Hz</div><div class="x" id="rt-10hz">–</div></div>
+          <div><div class="k">turbo</div><div class="x" id="rt-turbo">–</div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">What the model reads <span class="r" id="tick"></span></div>
+        <div class="mono" id="state">–</div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">Episode</div>
+        <div class="kv">
+          <div><span class="k">hp / armor</span><span class="x" id="hp">–</span></div>
+          <div><span class="k">kills</span><span class="x" id="kills">–</span></div>
+          <div><span class="k">pickups</span><span class="x" id="pickups">–</span></div>
+          <div><span class="k">weapon</span><span class="x" id="weapon">–</span></div>
+          <div><span class="k">alive</span><span class="x" id="alive">–</span></div>
+          <div><span class="k">deaths</span><span class="x" id="deaths">–</span></div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="footer" id="footer">
+    Decision latency is wall clock in the game loop, from the state being available to the action being available: prompt build plus
+    one vLLM engine step (prefill of the fresh state tokens and one output token). Frame streaming is outside that time. Switching behavior
+    changes only the control token: one checkpoint, one server, no adapter loading. The behaviors are imitation-learned from a scripted
+    teacher, which sets their skill ceiling. The Jev post does not state its hardware or model, so this is not a like-for-like comparison.
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const COLORS = { hunter: '#fa4d56', survivor: '#08bdba', scavenger: '#d2a106' };
+  const LABELS = { forward: 'forward', back: 'back', left: 'turn left', right: 'turn right', sl: 'strafe left', sr: 'strafe right',
+                   fl: 'forward + left', fr: 'forward + right', fire: 'fire', al: 'fire + aim left', ar: 'fire + aim right', wait: 'wait' };
+  let ws, gridN = 1, latest = null, spark = [];
+  const screen = $('screen'), sctx = screen.getContext('2d');
+  let tiles = [];
+
+  function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+  function connect() {
+    ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => { $('conn').textContent = 'live'; $('live-dot').classList.add('live'); };
+    ws.onclose = () => { $('conn').textContent = 'reconnecting'; $('live-dot').classList.remove('live'); setTimeout(connect, 1000); };
+    ws.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) { drawFrame(ev.data); return; }
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'tick') { latest = msg; }
+      else if (msg.type === 'route') { showRoute(msg); }
+    };
+  }
+
+  function drawFrame(buf) {
+    const idx = new Uint8Array(buf, 0, 1)[0];
+    const blob = new Blob([buf.slice(1)], { type: 'image/jpeg' });
+    createImageBitmap(blob).then((bmp) => {
+      if (gridN === 1 && idx === 0) { sctx.drawImage(bmp, 0, 0, screen.width, screen.height); }
+      else if (tiles[idx]) { const c = tiles[idx].canvas; c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height); }
+      bmp.close && bmp.close();
+    });
+  }
+
+  function buildGrid(n) {
+    const g = $('grid');
+    g.innerHTML = ''; tiles = [];
+    if (n === 1) { g.hidden = true; screen.hidden = false; return; }
+    const side = Math.round(Math.sqrt(n));
+    g.style.gridTemplateColumns = `repeat(${side}, 1fr)`;
+    g.hidden = false; screen.hidden = true;
+    for (let i = 0; i < n; i++) {
+      const t = document.createElement('div'); t.className = 'tile';
+      const c = document.createElement('canvas'); c.width = 224; c.height = 168;
+      const a = document.createElement('span'); a.className = 'tag';
+      const s = document.createElement('span'); s.className = 'tag tag-r';
+      t.append(c, a, s); g.append(t); tiles.push({ canvas: c, a, s });
+    }
+  }
+
+  function showRoute(r) {
+    const probs = Object.entries(r.probs || {}).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${(100 * v).toFixed(0)}%`).join(' · ');
+    $('route').innerHTML = `“${escapeHtml(r.text)}” → <b>${r.adapter}</b> <span class="m">(${(100 * r.prob).toFixed(0)}% · ${r.ms.toFixed(1)} ms · ${r.by})</span>` +
+      (probs ? `<br><span class="m">${probs}</span>` : '');
+  }
+  function escapeHtml(s) { return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+  const fmt = (x, d = 1) => (x === null || x === undefined ? '–' : Number(x).toFixed(Number(x) > 0 && Number(x) < 0.1 ? 3 : d));
+
+  function render() {
+    requestAnimationFrame(render);
+    const m = latest; if (!m) return; latest = null;
+    if (m.grid !== gridN) { gridN = m.grid; buildGrid(gridN); }
+    $('mix').hidden = gridN === 1;
+    for (const b of document.querySelectorAll('[data-mode]')) b.classList.toggle('on', b.dataset.mode === m.mode);
+    for (const b of document.querySelectorAll('[data-grid]')) b.classList.toggle('on', Number(b.dataset.grid) === m.grid);
+    for (const b of document.querySelectorAll('[data-shadow]')) b.classList.toggle('on', (b.dataset.shadow === '1') === m.shadow);
+    const allSame = m.tiles.every((t) => t.adapter === m.adapter);
+    for (const c of document.querySelectorAll('[data-adapter]')) c.classList.toggle('on', allSame && c.dataset.adapter === m.adapter);
+
+    $('policy-label').textContent = m.policy === 'expert' ? 'scripted teacher · no model' : 'granite switch · vLLM';
+    $('tics').textContent = `${fmt(m.tics_per_s, 0)} tics/s`;
+    $('tag-adapter').textContent = m.adapter; $('tag-adapter').style.borderLeft = `3px solid ${COLORS[m.adapter] || '#fff'}`;
+    $('tag-mode').textContent = { '35hz': 'decides every tic', '10hz': 'decides at 10 Hz', turbo: `turbo · ${fmt(m.tics_per_s / 35, 1)}× real time` }[m.mode];
+    $('tag-action').textContent = `${m.action_label}`;
+
+    const L = m.latency;
+    $('p50').textContent = fmt(L.p50, 1); $('p99').textContent = fmt(L.p99, 1);
+    $('dps').textContent = fmt(L.per_s, 0); $('lat-n').textContent = L.n ? `${L.n} decisions` : '';
+    const d = m.decision || {};
+    $('last-ms').textContent = fmt(d.ms, 1);
+    $('build').textContent = d.build_ms !== undefined ? `${(1000 * d.build_ms).toFixed(0)} µs` : '–';
+    $('engine').textContent = d.engine_ms !== undefined ? `${fmt(d.engine_ms, 1)} ms` : '–';
+    $('toks').textContent = m.policy === 'expert' ? 'n/a' : `${d.fresh ?? '–'} / ${d.cached ?? '–'}`;
+
+    const pct = (ms) => `${Math.min(100, (ms / 100) * 100)}%`;
+    if (L.p50 !== null) {
+      $('budget-fill').style.width = pct(L.p50); $('budget-p99').style.left = pct(L.p99);
+      const used = (100 * L.p50 / m.tic_ms);
+      $('budget-note').innerHTML = `p50 uses <b>${used.toFixed(0)}%</b> of a tic; amber tick = p99. ` +
+        (L.p50 > 0 ? `One tic fits <b>${Math.floor(m.tic_ms / L.p50)}</b> sequential decisions.` : '');
+      $('budget-fill').style.background = L.p99 < m.tic_ms ? 'var(--teal)' : 'var(--red)';
+    }
+
+    if (d.ms !== undefined) { spark.push(d.ms); if (spark.length > 240) spark.shift(); drawSpark(m.tic_ms); }
+
+    $('action-now').innerHTML = `${m.action_label}<span class="tok">${m.action}</span>`;
+    const top = (d.top3 || []);
+    $('bars').innerHTML = top.map(([a, p]) => `<div class="bar"><span class="n">${LABELS[a] || a}</span><span class="t"><i style="width:${(100 * p).toFixed(1)}%"></i></span><span class="p">${(100 * p).toFixed(1)}%</span></div>`).join('');
+    $('agree').textContent = m.agreement !== null && m.agreement !== undefined ? `teacher agreement ${(100 * m.agreement).toFixed(0)}%` : (m.policy === 'expert' ? 'teacher driving' : '');
+    $('shadow').textContent = m.shadow_actions ? 'Same state, other behaviors: ' + Object.entries(m.shadow_actions).filter(([k]) => k !== m.adapter).map(([k, v]) => `${k} → ${LABELS[v] || v}`).join(' · ') : '';
+
+    for (const mode of ['35hz', '10hz', 'turbo']) {
+      const r = (m.reaction || {})[mode];
+      $(`rt-${mode}`).textContent = r ? `${r.median.toFixed(0)} ms` : '–';
+      $(`rt-${mode}`).title = r ? `median of ${r.n} engagements (game time)` : '';
+    }
+    $('state').textContent = m.text; $('tick').textContent = `tic ${m.tick}`;
+    const s = m.stats, h = m.hud;
+    $('hp').textContent = `${h.hp} / ${h.armor}`; $('kills').textContent = s.kills; $('pickups').textContent = s.pickups;
+    $('weapon').textContent = h.weapon; $('alive').textContent = `${s.seconds.toFixed(0)} s`; $('deaths').textContent = s.deaths;
+
+    if (gridN > 1) m.tiles.forEach((t, i) => {
+      if (!tiles[i]) return;
+      tiles[i].a.textContent = t.adapter; tiles[i].a.style.borderLeft = `3px solid ${COLORS[t.adapter]}`;
+      tiles[i].s.textContent = `${t.action} · ${t.kills}k ${t.pickups}p`;
+    });
+  }
+
+  function drawSpark(tic) {
+    const c = $('spark'), dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth, h = c.clientHeight;
+    if (c.width !== w * dpr) { c.width = w * dpr; c.height = h * dpr; }
+    const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+    const ymax = Math.max(tic * 1.25, ...spark);
+    const y = (v) => h - (v / ymax) * (h - 4) - 2;
+    g.strokeStyle = '#6f6f6f'; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(0, y(tic)); g.lineTo(w, y(tic)); g.stroke(); g.setLineDash([]);
+    g.strokeStyle = '#08bdba'; g.lineWidth = 1.5; g.beginPath();
+    spark.forEach((v, i) => { const x = (i / 239) * w; i ? g.lineTo(x, y(v)) : g.moveTo(x, y(v)); }); g.stroke();
+  }
+
+  $('send').onclick = () => { const t = $('instr').value.trim(); if (t) { send({ type: 'instruction', text: t }); $('route').textContent = 'routing…'; } };
+  $('instr').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('send').click(); });
+  for (const c of document.querySelectorAll('[data-adapter]')) c.onclick = () => send({ type: 'adapter', name: c.dataset.adapter });
+  $('mix').onclick = () => send({ type: 'mix' });
+  for (const b of document.querySelectorAll('[data-mode]')) b.onclick = () => { spark = []; send({ type: 'mode', mode: b.dataset.mode }); };
+  for (const b of document.querySelectorAll('[data-grid]')) b.onclick = () => send({ type: 'grid', n: Number(b.dataset.grid) });
+  for (const b of document.querySelectorAll('[data-shadow]')) b.onclick = () => send({ type: 'shadow', on: b.dataset.shadow === '1' });
+  $('restart').onclick = () => send({ type: 'restart' });
+  connect(); render();
+})();
+</script>
+</body>
+</html>
