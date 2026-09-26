@@ -627,6 +627,12 @@ def main() -> None:
         "rl_teacher.py checkpoint (required for --policy rl)",
     )
     ap.add_argument("--engine-loop", action="store_true")
+    ap.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Style and planner sampling (vllm); the RL teacher plays by sampling",
+    )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--seed", type=int, default=0)
@@ -637,7 +643,11 @@ def main() -> None:
         args.teacher if args.teacher == "expert" else str(Path(args.teacher).resolve())
     )
     kw = (
-        {"engine_loop": args.engine_loop, "max_num_seqs": 128}
+        {
+            "engine_loop": args.engine_loop,
+            "max_num_seqs": 128,
+            "temperature": args.temperature,
+        }
         if args.policy == "vllm"
         else {}
     )

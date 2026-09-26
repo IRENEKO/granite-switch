@@ -333,6 +333,9 @@ def main() -> None:
         required=True,
     )
     ap.add_argument("--seed", type=int, default=3)
+    ap.add_argument(
+        "--temperature", type=float, default=1.0, help="Style and planner sampling"
+    )
     args = ap.parse_args()
 
     import imageio.v2 as imageio
@@ -341,7 +344,7 @@ def main() -> None:
         import torch
 
         where = torch.cuda.get_device_name(0).replace("NVIDIA ", "")
-        pol = make_policy("vllm", args.model, warmup=100)
+        pol = make_policy("vllm", args.model, warmup=100, temperature=args.temperature)
     else:
         where = "scripted teacher, no model"
         pol = make_policy("expert")
