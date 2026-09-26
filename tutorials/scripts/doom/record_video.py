@@ -6,7 +6,7 @@ or a free-text instruction (routed by the router adapter), plus seconds of game
 time::
 
     python record_video.py --model models/doom-round0 --out out/granite_doom.mp4 \
-        --segment "hunter" 20 \
+        --segment "fighter" 20 \
         --segment "stop fighting and grab health" 20 \
         --segment "collect all the loot" 20
 
@@ -34,8 +34,15 @@ from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from doom_env import ACTION_LABELS, DISPLAY_ORDER, TIC_HZ, TIC_MS, DoomEnv
-from expert import BEHAVIORS
+from doom_env import (
+    ACTION_LABELS,
+    DISPLAY_ORDER,
+    SHORT_LABELS,
+    TIC_HZ,
+    TIC_MS,
+    DoomEnv,
+)
+from expert import BEHAVIORS, PLAN_EVERY_TICS, Expert
 from policy import make_policy
 
 W_GAME, H = 640, 480
@@ -49,25 +56,12 @@ HELP = (168, 168, 168)
 BLUE = (15, 98, 254)
 TEAL = (8, 189, 186)
 AMBER = (210, 161, 6)
-COLORS = {"hunter": (250, 77, 86), "survivor": TEAL, "scavenger": AMBER}
+COLORS = {"fighter": (250, 77, 86), "cautious": TEAL, "collector": AMBER}
 
-H_HEAT = 206  # heatmap strip under the game and panel
+HEAT_ROW = 10  # pixels per action row
+H_HEAT = 70 + HEAT_ROW * len(DISPLAY_ORDER)  # heatmap strip under the game and panel
 HEAT_PX = 3  # pixels per tic
 HEAT_GUTTER = 100  # row labels
-HEAT_LABELS = {
-    "fire": "fire",
-    "al": "fire+aim L",
-    "ar": "fire+aim R",
-    "forward": "forward",
-    "fl": "fwd+left",
-    "fr": "fwd+right",
-    "left": "turn left",
-    "right": "turn right",
-    "sl": "strafe L",
-    "sr": "strafe R",
-    "back": "back",
-    "wait": "wait",
-}
 # Colour position is sqrt(p), so runner-up actions at a few percent stay visible.
 STOPS = [(0.0, BG), (0.35, (0, 45, 156)), (0.7, BLUE), (1.0, (200, 228, 255))]
 
@@ -176,7 +170,7 @@ class Panel:
         y += 26
 
         # Stats
-        d.text((x, y), "EPISODE", font=self.f_small, fill=HELP)
+        d.text((x, y), "MATCH", font=self.f_small, fill=HELP)
         y += 16
         s = t["stats"]
         d.text(
@@ -188,7 +182,7 @@ class Panel:
         y += 16
         d.text(
             (x, y),
-            f"kills {s['kills']}  pickups {s['pickups']}  deaths {t['deaths']}",
+            f"frags {s['frags']}  deaths {s['deaths']}  best bot {s['best_bot'][1]}",
             font=self.f_small,
             fill=TEXT2,
         )
@@ -232,7 +226,7 @@ class Heatmap:
         self.buf = np.empty((len(DISPLAY_ORDER) + 2, self.win, 3), np.uint8)
         self.buf[:] = BG
         self.count = 0
-        self.f = font(12, mono=True)
+        self.f = font(10, mono=True)
         self.f_small = font(11)
 
     def push(self, probs: dict[str, float], adapter: str, decided: bool) -> None:
@@ -261,13 +255,16 @@ class Heatmap:
         gap = np.empty((3, self.win, 3), np.uint8)
         gap[:] = BG
         rows = [np.repeat(self.buf[0:1], 6, axis=0), gap]
-        rows += [np.repeat(self.buf[i : i + 1], 11, axis=0) for i in range(1, n + 1)]
+        rows += [
+            np.repeat(self.buf[i : i + 1], HEAT_ROW, axis=0) for i in range(1, n + 1)
+        ]
         rows += [gap, np.repeat(self.buf[n + 1 : n + 2], 4, axis=0)]
         arr = np.repeat(np.concatenate(rows, axis=0), HEAT_PX, axis=1)
         top = y0 + 28
         img.paste(Image.fromarray(arr), (HEAT_GUTTER, top))
         for i, a in enumerate(DISPLAY_ORDER):
-            d.text((18, top + 9 + 11 * i - 1), HEAT_LABELS[a], font=self.f, fill=TEXT2)
+            y = top + 9 + HEAT_ROW * i - 1
+            d.text((18, y), SHORT_LABELS[a], font=self.f, fill=TEXT2)
         yb = top + arr.shape[0] + 4
         d.text(
             (HEAT_GUTTER, yb),
@@ -314,6 +311,7 @@ def main() -> None:
         pol = make_policy("expert")
     env = DoomEnv(seed=args.seed, resolution="640X480", hud=True, timeout_tics=10**7)
     obs = env.reset(seed=args.seed)
+    planner = Expert()  # the weapon planner, until the arms adapter drives it
     panel = Panel()
     heat = Heatmap(W_GAME + W_PANEL)
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -322,7 +320,7 @@ def main() -> None:
     )
     lat: deque[float] = deque(maxlen=1000)
     last_second: deque[float] = deque(maxlen=TIC_HZ)
-    deaths, all_ms = 0, []
+    all_ms = []
     for what, secs in args.segment:
         info: dict = {"instruction": None}
         if what in BEHAVIORS:
@@ -337,17 +335,22 @@ def main() -> None:
                 "route_ms": r.ms,
             }
         print(f"segment: {what!r} -> {adapter} for {secs}s", flush=True)
+        action = "wait"
         for _ in range(int(float(secs) * TIC_HZ)):
-            d = pol.decide(obs, adapter)
-            heat.push(d.probs, adapter, decided=True)
-            last_second.append(d.ms)
-            lat.append(d.ms)
-            all_ms.append(d.ms)
+            if obs.dead:  # respawning: nothing to decide
+                heat.push({}, adapter, decided=False)
+            else:
+                d = pol.decide(obs, adapter)
+                action = d.action
+                heat.push(d.probs, adapter, decided=True)
+                last_second.append(d.ms)
+                lat.append(d.ms)
+                all_ms.append(d.ms)
             frame = env.frame()
             text, hud = obs.text, (obs.hp, obs.armor, obs.weapon)
-            obs = env.step(d.action)
+            weapon = planner.weapon(obs) if obs.tick % PLAN_EVERY_TICS == 0 else None
+            obs = env.step(action, weapon=weapon)
             if obs.done:
-                deaths += env.stats.died
                 obs = env.reset()
             img = Image.new("RGB", (W_GAME + W_PANEL, H + H_HEAT), BG)
             img.paste(Image.fromarray(frame), (0, 0))
@@ -360,12 +363,11 @@ def main() -> None:
                     "ms": float(np.median(last_second)),
                     "p50": float(np.percentile(a, 50)),
                     "p99": float(np.percentile(a, 99)),
-                    "action": d.action,
+                    "action": action,
                     "stats": env.stats.as_dict(),
                     "hp": hud[0],
                     "armor": hud[1],
                     "weapon": hud[2],
-                    "deaths": deaths,
                     "text": text,
                     "tick": obs.tick,
                     "gpu": where,

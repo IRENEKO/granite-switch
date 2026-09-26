@@ -104,7 +104,7 @@
   .budget-note b { color: var(--text-pri); font-weight: 500; }
 
   canvas.spark { width: 100%; height: 70px; display: block; }
-  canvas.heat { width: 100%; height: 214px; display: block; }
+  canvas.heat { width: 100%; height: 300px; display: block; }
   .heat-legend { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-family: var(--mono); font-size: 10px; color: var(--text-help); }
   .heat-legend .ramp { flex: 1; height: 8px; position: relative; }
   .heat-legend .ramp span { position: absolute; top: 10px; transform: translateX(-50%); }
@@ -159,9 +159,9 @@
 
       <div class="row">
         <span class="seg-label">Behavior</span>
-        <button class="chip" data-adapter="hunter"><span class="sw" style="background:var(--red)"></span>hunter</button>
-        <button class="chip" data-adapter="survivor"><span class="sw" style="background:var(--teal)"></span>survivor</button>
-        <button class="chip" data-adapter="scavenger"><span class="sw" style="background:var(--amber)"></span>scavenger</button>
+        <button class="chip" data-adapter="fighter"><span class="sw" style="background:var(--red)"></span>fighter</button>
+        <button class="chip" data-adapter="cautious"><span class="sw" style="background:var(--teal)"></span>cautious</button>
+        <button class="chip" data-adapter="collector"><span class="sw" style="background:var(--amber)"></span>collector</button>
         <button class="chip" id="mix" hidden>mix</button>
       </div>
       <div class="row">
@@ -227,7 +227,7 @@
       </div>
 
       <div class="card">
-        <div class="eyebrow">Reaction time <span class="r">hunter · monster on screen → first shot</span></div>
+        <div class="eyebrow">Reaction time <span class="r">fighter · bot on screen → first shot</span></div>
         <div class="reaction">
           <div><div class="k">every tic</div><div class="x" id="rt-35hz">–</div></div>
           <div><div class="k">10 Hz</div><div class="x" id="rt-10hz">–</div></div>
@@ -244,7 +244,7 @@
         <div class="eyebrow">Episode</div>
         <div class="kv">
           <div><span class="k">hp / armor</span><span class="x" id="hp">–</span></div>
-          <div><span class="k">kills</span><span class="x" id="kills">–</span></div>
+          <div><span class="k">frags</span><span class="x" id="kills">–</span></div>
           <div><span class="k">pickups</span><span class="x" id="pickups">–</span></div>
           <div><span class="k">weapon</span><span class="x" id="weapon">–</span></div>
           <div><span class="k">alive</span><span class="x" id="alive">–</span></div>
@@ -265,9 +265,8 @@
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
-  const COLORS = { hunter: '#fa4d56', survivor: '#08bdba', scavenger: '#d2a106' };
-  const LABELS = { forward: 'forward', back: 'back', left: 'turn left', right: 'turn right', sl: 'strafe left', sr: 'strafe right',
-                   fl: 'forward + left', fr: 'forward + right', fire: 'fire', al: 'fire + aim left', ar: 'fire + aim right', wait: 'wait' };
+  const COLORS = { fighter: '#fa4d56', cautious: '#08bdba', collector: '#d2a106' };
+  let LABELS = {};  // short action labels, sent by the server
   let ws, gridN = 1, latest = null, spark = [];
   const screen = $('screen'), sctx = screen.getContext('2d');
   let tiles = [];
@@ -285,7 +284,7 @@
       if (msg.type === 'tick') {
         // Every message carries the tics since the last one; take them all
         // here, since render() only sees the latest message per frame.
-        if (!heatOrder && msg.order) heatInit(msg.order, msg.behaviors);
+        if (!heatOrder && msg.order) { LABELS = msg.labels || {}; heatInit(msg.order, msg.behaviors); }
         if (heatOrder) (msg.heat || []).forEach(heatPush);
         latest = msg;
       }
@@ -376,13 +375,13 @@
     }
     $('state').textContent = m.text; $('tick').textContent = `tic ${m.tick}`;
     const s = m.stats, h = m.hud;
-    $('hp').textContent = `${h.hp} / ${h.armor}`; $('kills').textContent = s.kills; $('pickups').textContent = s.pickups;
+    $('hp').textContent = `${h.hp} / ${h.armor}`; $('kills').textContent = s.frags; $('pickups').textContent = s.pickups;
     $('weapon').textContent = h.weapon; $('alive').textContent = `${s.seconds.toFixed(0)} s`; $('deaths').textContent = s.deaths;
 
     if (gridN > 1) m.tiles.forEach((t, i) => {
       if (!tiles[i]) return;
       tiles[i].a.textContent = t.adapter; tiles[i].a.style.borderLeft = `3px solid ${COLORS[t.adapter]}`;
-      tiles[i].s.textContent = `${t.action} · ${t.kills}k ${t.pickups}p`;
+      tiles[i].s.textContent = `${t.action} · ${t.frags}f ${t.deaths}d`;
     });
   }
 
@@ -391,9 +390,7 @@
   // smoothing when drawn. Row 0 is the behavior strip, the last row marks
   // tics that had a fresh decision.
   const WIN = 350;  // 10 s of tics
-  const HEAT_LABELS = { fire: 'fire', al: 'fire+aim L', ar: 'fire+aim R', forward: 'forward', fl: 'fwd+left', fr: 'fwd+right',
-                        left: 'turn left', right: 'turn right', sl: 'strafe L', sr: 'strafe R', back: 'back', wait: 'wait' };
-  const BEHAVIOR_RGB = { hunter: [250, 77, 86], survivor: [8, 189, 186], scavenger: [210, 161, 6] };
+  const BEHAVIOR_RGB = { fighter: [250, 77, 86], cautious: [8, 189, 186], collector: [210, 161, 6] };
   const STOPS = [[0, [22, 22, 22]], [0.35, [0, 45, 156]], [0.7, [15, 98, 254]], [1, [200, 228, 255]]];
   const heatOff = document.createElement('canvas');
   let heatCtx = null, heatOrder = null, heatBehaviors = null, heatCount = 0;
@@ -431,13 +428,13 @@
     if (c.width !== w * dpr) { c.width = w * dpr; c.height = h * dpr; }
     const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
     g.imageSmoothingEnabled = false;
-    const gut = 84, n = heatOrder.length, stripH = 6, markH = 4, axisH = 14;
+    const gut = 90, n = heatOrder.length, stripH = 6, markH = 4, axisH = 14;
     const rowH = (h - stripH - markH - axisH - 6) / n, cw = w - gut;
     g.drawImage(heatOff, 0, 0, WIN, 1, gut, 0, cw, stripH);
     g.drawImage(heatOff, 0, 1, WIN, n, gut, stripH + 3, cw, n * rowH);
     g.drawImage(heatOff, 0, n + 1, WIN, 1, gut, stripH + 3 + n * rowH + 3, cw, markH);
-    g.font = '11px "IBM Plex Mono", monospace'; g.textBaseline = 'middle'; g.fillStyle = '#c6c6c6';
-    heatOrder.forEach((a, i) => g.fillText(HEAT_LABELS[a] || a, 0, stripH + 3 + (i + 0.5) * rowH));
+    g.font = '10px "IBM Plex Mono", monospace'; g.textBaseline = 'middle'; g.fillStyle = '#c6c6c6';
+    heatOrder.forEach((a, i) => g.fillText(LABELS[a] || a, 0, stripH + 3 + (i + 0.5) * rowH));
     g.fillStyle = '#a8a8a8'; g.textBaseline = 'bottom';
     g.fillText('−10 s', gut, h); g.fillText('now', w - 24, h);
   }

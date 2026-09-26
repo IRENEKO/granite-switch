@@ -9,8 +9,9 @@ Then open http://localhost:8000. From a laptop, tunnel to the GPU host:
 
 Layout:
 
-* Each game runs in its own worker process: env stepping, the three scripted
-  teachers (for the expert policy, shadow decisions and live teacher agreement),
+* Each game runs in its own worker process: env stepping (a deathmatch against
+  seven bots), the three scripted styles (for the expert policy, shadow
+  decisions and live teacher agreement), the scripted weapon planner,
   reaction-time tracking and JPEG encoding. The measured decision is therefore
   just prompt build plus the engine step.
 * One loop thread owns the policy. Every tic it takes the latest state of every
@@ -46,30 +47,35 @@ from fastapi.responses import FileResponse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from doom_env import ACTION_LABELS, DISPLAY_ORDER, TIC_HZ, TIC_MS, DoomEnv
-from expert import BEHAVIORS, Expert
+from doom_env import (
+    ACTION_LABELS,
+    ATTACKS,
+    DISPLAY_ORDER,
+    SHORT_LABELS,
+    TIC_HZ,
+    TIC_MS,
+    DoomEnv,
+)
+from expert import BEHAVIORS, PLAN_EVERY_TICS, Expert
 from policy import make_policy
 
 STATIC = Path(__file__).parent / "static"
 MODES = ("35hz", "10hz", "turbo")
 GRID_SIZES = (1, 4, 9, 16)
-ATTACKS = ("fire", "al", "ar")
-REACTION_QUIET_TICS = (
-    TIC_HZ  # a monster must be unseen this long to count as "appearing"
-)
+REACTION_QUIET_TICS = TIC_HZ  # a bot must be unseen this long to count as "appearing"
 
 
 # ── Game worker process ────────────────────────────────────────────────────────
 class _Reaction:
-    """Game-time from a monster appearing on screen to the first shot at it."""
+    """Game-time from a bot appearing on screen to the first shot at it."""
 
     def __init__(self) -> None:
         self.last_seen = -(10**9)
         self.appeared: int | None = None
 
-    def update(self, tick: int, monster_visible: bool, action: str) -> float | None:
+    def update(self, tick: int, enemy_visible: bool, action: str) -> float | None:
         out = None
-        if monster_visible:
+        if enemy_visible:
             if self.appeared is None and tick - self.last_seen > REACTION_QUIET_TICS:
                 self.appeared = tick
             self.last_seen = tick
@@ -96,7 +102,7 @@ def _worker(conn, seed: int) -> None:
     env = DoomEnv(seed=seed, resolution="640X480", hud=True, timeout_tics=10**7)
     experts = {b: Expert() for b in BEHAVIORS}
     reaction = _Reaction()
-    episodes, deaths, obs = 0, 0, env.reset(seed=seed)
+    episodes, obs = 0, env.reset(seed=seed)
 
     def state(extra: dict) -> dict:
         t0 = time.perf_counter()
@@ -106,14 +112,18 @@ def _worker(conn, seed: int) -> None:
             "text": obs.text,
             "expert": labels,
             "expert_ms": expert_ms,
+            "planner": experts[BEHAVIORS[0]].weapon(obs),
+            "dead": obs.dead,
             "tick": obs.tick,
             "hud": {
                 "hp": obs.hp,
                 "armor": obs.armor,
                 "ammo": obs.ammo,
                 "weapon": obs.weapon,
+                "frags": obs.frags,
+                "deaths": obs.deaths,
             },
-            "stats": {**env.stats.as_dict(), "episodes": episodes, "deaths": deaths},
+            "stats": {**env.stats.as_dict(), "episodes": episodes},
             **extra,
         }
 
@@ -129,15 +139,14 @@ def _worker(conn, seed: int) -> None:
                 e.reset()
             episodes += 1
         else:
-            _, action, frame_size, quality = msg
-            visible = any(o.kind == "monster" for o in obs.seen)
+            _, action, weapon, frame_size, quality = msg
+            visible = any(o.kind == "enemy" for o in obs.seen)
             r = reaction.update(obs.tick, visible, action)
             if r is not None:
                 extra["reaction_ms"] = r
-            obs = env.step(action)
+            obs = env.step(action, weapon=weapon)
             if obs.done:
                 extra["episode"] = env.stats.as_dict()
-                deaths += env.stats.died
                 episodes += 1
                 obs = env.reset()
                 for e in experts.values():
@@ -330,7 +339,8 @@ class GameLoop(threading.Thread):
             due = [
                 g
                 for g in games
-                if self.mode != "10hz" or _on_10hz_beat(g.state["tick"])
+                if not g.state["dead"]
+                and (self.mode != "10hz" or _on_10hz_beat(g.state["tick"]))
             ]
             decs = self._decide(due)
             if decs:
@@ -351,10 +361,15 @@ class GameLoop(threading.Thread):
                 if want:
                     last_frame[g.index] = now
                 size = None if not want else ((640, 480) if single else (224, 168))
-                g.conn.send(("step", g.last_action, size, 70 if single else 60))
+                weapon = (
+                    g.state["planner"]
+                    if g.state["tick"] % PLAN_EVERY_TICS == 0
+                    else None
+                )
+                g.conn.send(("step", g.last_action, weapon, size, 70 if single else 60))
             for g in games:
                 g.state = g.conn.recv()
-                if "reaction_ms" in g.state and g.adapter == "hunter":
+                if "reaction_ms" in g.state and g.adapter == "fighter":
                     self.reaction[self.mode].append(g.state["reaction_ms"])
                 jpeg = g.state.pop("jpeg", None)
                 if jpeg is not None:
@@ -421,6 +436,7 @@ class GameLoop(threading.Thread):
             "tic_ms": round(TIC_MS, 2),
             "heat": self.heat,
             "order": DISPLAY_ORDER,
+            "labels": SHORT_LABELS,
             "behaviors": BEHAVIORS,
             "reaction": rt,
             "agreement": round(sum(self.agree) / len(self.agree), 3)
@@ -431,8 +447,8 @@ class GameLoop(threading.Thread):
                     "adapter": g.adapter,
                     "action": g.last_action,
                     "hp": g.state["hud"]["hp"],
-                    "kills": g.state["stats"]["kills"],
-                    "pickups": g.state["stats"]["pickups"],
+                    "frags": g.state["stats"]["frags"],
+                    "deaths": g.state["stats"]["deaths"],
                 }
                 for g in games
             ],

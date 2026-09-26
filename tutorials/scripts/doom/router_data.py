@@ -30,34 +30,34 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from expert import BEHAVIORS
 
 STYLE = {
-    "hunter": "aggressive: seek out monsters, attack and kill them; only heal when nearly dead",
-    "survivor": "cautious: stay alive, avoid fights, keep distance from monsters, pick up health and armor",
-    "scavenger": "collector: gather items, ammo, armor and weapons; only shoot monsters that get very close",
+    "fighter": "aggressive: hunt the other players, attack and frag them; only heal when nearly dead",
+    "cautious": "careful: stay alive, avoid fights, keep distance from enemies, pick up health and armor",
+    "collector": "collector: gather items, ammo, armor and weapons; only shoot enemies that get very close",
 }
 
 SEEDS = {
-    "hunter": [
+    "fighter": [
         "go kill everything",
         "hunt them down",
         "attack!",
         "clear the room",
         "be aggressive",
-        "shoot every monster you see",
+        "shoot every bot you see",
         "go on a rampage",
         "take the fight to them",
         "rip and tear",
         "frag them all",
-        "chase down the zombies",
+        "chase them down",
         "no mercy",
         "find something to kill",
         "aggressive mode",
         "fight fight fight",
     ],
-    "survivor": [
+    "cautious": [
         "stay alive",
         "play it safe",
         "stop fighting and grab health",
-        "avoid the monsters",
+        "avoid the bots",
         "keep your distance",
         "don't die",
         "heal up",
@@ -70,7 +70,7 @@ SEEDS = {
         "survive as long as you can",
         "back off",
     ],
-    "scavenger": [
+    "collector": [
         "collect all the loot",
         "grab the ammo",
         "pick up everything",
@@ -81,7 +81,7 @@ SEEDS = {
         "get the items",
         "stock up on ammo",
         "scavenge",
-        "collect stuff and ignore the zombies",
+        "collect stuff and ignore the bots",
         "pick up the shotgun shells",
         "go shopping",
         "sweep the room for items",
@@ -91,19 +91,19 @@ SEEDS = {
 
 # Hand-written, never shown to the generator: the router's eval set.
 HELDOUT = {
-    "hunter": [
+    "fighter": [
         "i want carnage",
-        "exterminate the demons",
+        "exterminate them all",
         "time to go berserk",
         "hit them before they hit you",
-        "wipe out the imps",
+        "top the scoreboard",
         "you're the predator now",
         "make them pay",
-        "kill count, let's go up",
+        "frag count, let's go up",
         "blast whatever moves",
         "seek and destroy",
     ],
-    "survivor": [
+    "cautious": [
         "you're almost dead, be smart",
         "lay low for a bit",
         "don't engage, just stay healthy",
@@ -115,7 +115,7 @@ HELDOUT = {
         "safety first",
         "patch up, stay out of trouble",
     ],
-    "scavenger": [
+    "collector": [
         "empty the map of goodies",
         "hoover up the pickups",
         "go treasure hunting",

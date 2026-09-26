@@ -31,22 +31,29 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from doom_env import ACTIONS, Observation
+from doom_env import ACTIONS, WEAPON_SLOTS, Observation
 from expert import BEHAVIORS, Expert
 
+ARMS = "arms"  # weapon planner: one slot digit
+CRITIC = "critic"  # danger of taking damage or dying within 1 s
 ROUTER = "router"
-ADAPTERS: tuple[str, ...] = (*BEHAVIORS, ROUTER)
+ADAPTERS: tuple[str, ...] = (*BEHAVIORS, ARMS, CRITIC, ROUTER)
+WEAPON_TOKENS: tuple[str, ...] = tuple(str(s) for s in WEAPON_SLOTS)
+DANGER_LEVELS: tuple[str, ...] = ("low", "mid", "high")
 
 SYSTEM_PROMPT = (
-    "You play Doom. Each message is the game state: health, armor, ammo, weapon; "
-    "objects on screen as name, bearing in degrees (negative is left) and distance; "
-    "wall clearance left, front and right in metres; damage taken in the last second; "
-    "your last two actions. Reply with one action: " + " ".join(ACTIONS) + "."
+    "You play Doom deathmatch against bots. The game state gives health, armor, the "
+    "selected weapon and its ammo, owned weapon slots with ammo; objects on screen as "
+    "name, bearing in degrees (negative is left) and distance; wall clearance left, "
+    "front, right and behind in metres; damage taken in the last second; where an "
+    "enemy was last seen; your last two actions. Reply with what is asked: one action ("
+    + " ".join(ACTIONS)
+    + "), a weapon slot (1-7), or the danger of being hit soon (low mid high)."
 )
 ROUTER_SYSTEM_PROMPT = (
-    "Pick the Doom play style that best follows the player's instruction: "
-    "hunter (seek and kill monsters), survivor (avoid damage, keep distance, heal), "
-    "scavenger (collect items). Reply with the style name."
+    "Pick the Doom deathmatch play style that best follows the player's instruction: "
+    "fighter (hunt and frag the bots), cautious (avoid damage, fight only up close, "
+    "heal), collector (collect items, armor and weapons). Reply with the style name."
 )
 
 _SOR, _EOR, _EOT = "<|start_of_role|>", "<|end_of_role|>", "<|end_of_text|>"
@@ -94,12 +101,25 @@ def single_token_id(tokenizer, text: str) -> int:
     return ids[0]
 
 
-def action_token_ids(tokenizer) -> dict[str, int]:
-    """Map each action to its single token id; fail loudly if any is not one token."""
-    ids = {a: single_token_id(tokenizer, a) for a in ACTIONS}
+def output_token_ids(tokenizer, words: tuple[str, ...]) -> dict[str, int]:
+    """Map each output word to its single token id; fail loudly if any is not one
+    token or two share one."""
+    ids = {w: single_token_id(tokenizer, w) for w in words}
     if len(set(ids.values())) != len(ids):
-        raise ValueError(f"action tokens collide: {ids}")
+        raise ValueError(f"output tokens collide: {ids}")
     return ids
+
+
+def action_token_ids(tokenizer) -> dict[str, int]:
+    return output_token_ids(tokenizer, ACTIONS)
+
+
+def weapon_token_ids(tokenizer) -> dict[str, int]:
+    return output_token_ids(tokenizer, WEAPON_TOKENS)
+
+
+def danger_token_ids(tokenizer) -> dict[str, int]:
+    return output_token_ids(tokenizer, DANGER_LEVELS)
 
 
 def route_token_ids(tokenizer) -> dict[str, int]:
@@ -152,7 +172,7 @@ def check_template(model_dir: str, texts: list[str]) -> None:
     composed = control_token(BEHAVIORS[0]) in tok.get_vocab()
     adapters = ADAPTERS if composed else ()
     for system, names in (
-        (SYSTEM_PROMPT, (*BEHAVIORS, None)),
+        (SYSTEM_PROMPT, (*BEHAVIORS, ARMS, CRITIC, None)),
         (ROUTER_SYSTEM_PROMPT, (ROUTER, None)),
     ):
         pb = PromptBuilder(tok, system, adapters)
@@ -169,20 +189,40 @@ def check_template(model_dir: str, texts: list[str]) -> None:
                 ref = tok(rendered, add_special_tokens=False).input_ids
                 got = pb.ids(text, a)
                 assert got == ref, f"adapter={a}\n got={got}\n ref={ref}\n{rendered!r}"
-    action_token_ids(tok)
-    route_token_ids(tok)
+    check_output_tokens(tok)
     print(
         f"OK: prompt ids match apply_chat_template for "
         f"{'adapters ' + ', '.join(ADAPTERS) + ' and base' if composed else 'the base template'} "
-        f"on {len(texts)} states; action and route tokens are single and distinct."
+        f"on {len(texts)} states."
     )
+
+
+def check_output_tokens(tok) -> None:
+    """Every output vocabulary is single tokens, distinct within its adapter, and
+    unchanged when it directly follows ``<|end_of_role|>`` (where it is emitted)."""
+    groups = {
+        "actions": action_token_ids(tok),
+        "weapon slots": weapon_token_ids(tok),
+        "danger levels": danger_token_ids(tok),
+        "route first tokens": route_token_ids(tok),
+    }
+    eor = tok.encode(_EOR, add_special_tokens=False)
+    for name, ids in groups.items():
+        if name == "route first tokens":
+            continue
+        for w, i in ids.items():
+            got = tok.encode(_EOR + w, add_special_tokens=False)
+            if got != [*eor, i]:
+                raise ValueError(f"{w!r} after {_EOR} tokenizes as {got}")
+    for name, ids in groups.items():
+        print(f"  {name}: {len(ids)} single, distinct tokens")
 
 
 # ── Keyword router (stand-in when no model is loaded) ───────────────────────────
 _KEYWORDS = {
-    "hunter": r"kill|hunt|fight|attack|shoot|aggress|destroy|frag|slay|murder|rampage|clear",
-    "survivor": r"surviv|safe|careful|avoid|run away|flee|hide|retreat|heal|health|defen|cautious|stay alive|don.t die",
-    "scavenger": r"collect|loot|pick|gather|item|ammo|armor|scaveng|grab|supplies|weapon",
+    "fighter": r"kill|hunt|fight|attack|shoot|aggress|destroy|frag|slay|murder|rampage|clear",
+    "cautious": r"surviv|safe|careful|avoid|run away|flee|hide|retreat|heal|health|defen|cautious|stay alive|don.t die",
+    "collector": r"collect|loot|pick|gather|item|ammo|armor|scaveng|grab|supplies|weapon",
 }
 
 
@@ -192,19 +232,19 @@ _NEGATION = r"(?:stop|don.?t|do not|no|never|quit|avoid|without)\s+(?:\w+\s+){0,
 def keyword_route(instruction: str) -> Route:
     t0 = time.perf_counter()
     text = instruction.lower()
-    # "stop fighting" is a vote for survivor, not hunter.
+    # "stop fighting" is a vote for cautious, not fighter.
     negated_fights = len(
-        re.findall(_NEGATION + "(?:" + _KEYWORDS["hunter"] + ")", text)
+        re.findall(_NEGATION + "(?:" + _KEYWORDS["fighter"] + ")", text)
     )
-    text = re.sub(_NEGATION + "(?:" + _KEYWORDS["hunter"] + ")\\w*", " ", text)
+    text = re.sub(_NEGATION + "(?:" + _KEYWORDS["fighter"] + ")\\w*", " ", text)
     scores = {b: len(re.findall(p, text)) for b, p in _KEYWORDS.items()}
-    scores["survivor"] += negated_fights
+    scores["cautious"] += negated_fights
     total = sum(scores.values())
     if total == 0:
         probs = {b: 1 / len(BEHAVIORS) for b in BEHAVIORS}
     else:
         probs = {b: s / total for b, s in scores.items()}
-    best = max(probs, key=lambda b: (probs[b], b == "hunter"))
+    best = max(probs, key=lambda b: (probs[b], b == "fighter"))
     return Route(best, probs[best], (time.perf_counter() - t0) * 1000, probs)
 
 
@@ -412,8 +452,8 @@ class VLLMPolicy:
 
     def _warmup(self, n: int) -> None:
         text = (
-            "hp 100 armor 0 ammo 50 pistol | see zombie -12 8m, medikit +40 3m | "
-            "wall l3 f9 r9 | hit 0 | last forward forward"
+            "hp 100 armor 0 | pistol 50 | arms 2:50 | see bot -12 8m, medikit +40 3m | "
+            "wall l3 f9 r9 b2 | hit 0 | last forward forward"
         )
         for i in range(n):
             self.decide(
@@ -454,7 +494,8 @@ def main() -> None:
         obs = env.reset(seed=ep)
         pol.reset()
         while not obs.done and len(texts) < 400 * (ep + 1):
-            texts.append(obs.text)
+            if not obs.dead:
+                texts.append(obs.text)
             obs = env.step(pol.decide(obs, BEHAVIORS[ep % len(BEHAVIORS)]).action)
     env.close()
     texts.extend(

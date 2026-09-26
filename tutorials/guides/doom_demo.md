@@ -8,6 +8,52 @@ token.
 
 The code lives in [`tutorials/scripts/doom/`](../scripts/doom/doom_env.py).
 
+> **Status.** Everything below, from "What the demo measures" on, is round 0:
+> monsters on `deathmatch.wad`, 12 actions, and the behaviors `hunter`,
+> `survivor` and `scavenger`, measured at commit `9197adc`. The scripts have
+> since moved to stage 2, described in the next section, and the round-0
+> commands no longer reproduce those numbers.
+
+## Stage 2 (in progress): deathmatch against built-in bots
+
+The arena is cig.wad MAP02, a full deathmatch against seven ZDoom bots, hosted
+in synchronous `Mode.PLAYER`. It differs from the ViZDoom competition rules in
+two disclosed ways: `+viz_nocheat` is off, because the labels, objects and
+sector data the state is built from need it off; and vertical autoaim is on,
+because the action space is 2D. The model reads structured state, not pixels.
+The action vocabulary grows to 20 single tokens, adding charge, fire while
+backing or strafing, strafe-running and circle-strafing. Weapons are chosen by a
+separate planner every 0.5 s (slot digits `1`-`7`). The styles are `fighter`,
+`cautious` and `collector`.
+
+Stage 0 measurements, on an M-series MacBook with 14 cores:
+
+- **Environment throughput** with 7 bots and labels, objects and sectors on,
+  running the full wrapper (state text, features, scripted policy), 12
+  processes at once: 424 tics/s per process at 320x240, 212 tics/s at
+  640x480. The gate is 3 x 35 = 105.
+- **Output tokens.** All 20 actions, the weapon slots `1`-`7` and the danger
+  levels `low`/`mid`/`high` are single, distinct Granite 4.1 tokens, also
+  directly after `<|end_of_role|>` (`policy.py --check-template`).
+- **Scripted baseline** ([`expert.py`](../scripts/doom/expert.py)) against the
+  default bots: 12 ten-minute matches for `fighter`, 6 each for the other
+  styles.
+
+  | Style | Frags | Deaths | Best bot's frags | Margin | Top frag count |
+  |---|---:|---:|---:|---:|---:|
+  | fighter | 23.4 ± 11.5 | 7.4 ± 4.4 | 35.3 ± 8.5 | -11.9 ± 11.9 | 2 of 12 |
+  | cautious | 14.5 ± 7.2 | 3.7 ± 3.9 | 29.3 ± 6.1 | -14.8 ± 12.1 | 1 of 6 |
+  | collector | 9.2 ± 8.4 | 3.0 ± 2.5 | 33.3 ± 4.3 | -24.2 ± 11.8 | 0 of 6 |
+
+  The fighter's frags track how long a bot is on screen. In its worst matches
+  (0-5 frags) a bot was in view for under 35 of 600 s: the scripted player gets
+  stuck in quiet parts of the map.
+- **Bot skill matters little.** In matches mixing three skill-20 and three
+  skill-100 bots (8 matches, 6 minutes each), the two groups scored 272 and 303
+  frags. In ZDoom free-for-all the bots mostly frag each other. The benchmark is
+  therefore the **default bots**, the first seven of the `bots.cfg` shipped with
+  ViZDoom, unchanged ([`bots.cfg`](../scripts/doom/bots.cfg)).
+
 ## What the demo measures, and what it claims
 
 - **Decision latency** is wall clock in the game loop, from "state available" to

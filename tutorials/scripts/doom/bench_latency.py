@@ -62,14 +62,16 @@ def pct(xs: list[float]) -> dict:
 
 def expert_states(episodes: int, seed: int) -> list[str]:
     """Consecutive state texts from expert play: the real prompt distribution."""
-    env, ex, texts = DoomEnv(seed=seed, hud=True, resolution="640X480"), Expert(), []
+    env = DoomEnv(seed=seed, hud=True, resolution="640X480", timeout_tics=60 * 35)
+    ex, texts = Expert(), []
     for ep in range(episodes):
         b = BEHAVIORS[ep % len(BEHAVIORS)]
         obs = env.reset(seed=seed + ep)
         ex.reset()
         while not obs.done:
-            texts.append(obs.text)
-            obs = env.step(ex.act(obs, b))
+            if not obs.dead:
+                texts.append(obs.text)
+            obs = env.step(ex.act(obs, b), weapon=ex.weapon(obs))
     env.close()
     return texts
 
@@ -104,7 +106,8 @@ def bench_decode(pol: VLLMPolicy, n_tokens: int = 64, reps: int = 10) -> dict:
     engine = pol.llm.llm_engine
     sp = SamplingParams(max_tokens=n_tokens, ignore_eos=True, temperature=0.0)
     prompt = pol.pb.ids(
-        "hp 100 armor 0 ammo 50 pistol | see nothing | wall l9 f9 r9 b9 | hit 0", None
+        "hp 100 armor 0 | pistol 50 | arms 2:50 | see nothing | wall l9 f9 r9 b9 | hit 0",
+        None,
     )
     steps = []
     for r in range(reps):
@@ -164,6 +167,9 @@ def bench_live(pol: VLLMPolicy, seconds: float, seed: int) -> dict:
     while time.perf_counter() < t_end:
         if obs.done:
             obs = env.reset()
+        if obs.dead:
+            obs = env.step("wait")
+            continue
         d = pol.decide(obs, BEHAVIORS[(n // 350) % len(BEHAVIORS)])
         t = time.perf_counter()
         obs = env.step(d.action)

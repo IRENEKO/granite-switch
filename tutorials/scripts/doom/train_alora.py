@@ -9,8 +9,8 @@ target token.
 
 Behavior adapter, from collect.py rows (label = ``expert``)::
 
-    python train_alora.py --adapter hunter --data data/round0/hunter.jsonl \
-        data/round1/hunter.jsonl --base /path/granite-4.1-3b --out runs/r1/hunter
+    python train_alora.py --adapter fighter --data data/round0/fighter.jsonl \
+        data/round1/fighter.jsonl --base /path/granite-4.1-3b --out runs/r1/fighter
 
 Router, from router_data.py rows (label = ``label``)::
 
@@ -143,7 +143,7 @@ def evaluate(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument(
-        "--adapter", required=True, help="hunter | survivor | scavenger | router"
+        "--adapter", required=True, help="fighter | cautious | collector | router"
     )
     ap.add_argument("--data", type=Path, nargs="+", required=True)
     ap.add_argument(

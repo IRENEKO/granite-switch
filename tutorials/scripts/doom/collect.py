@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Roll out expert or student policies in parallel ViZDoom envs; write jsonl + stats.
+"""Play deathmatches against bots in parallel ViZDoom envs; write jsonl + stats.
 
-Expert rollouts (round 0), with DART-style noise for wider state coverage::
+Scripted-expert matches, with DART-style noise for wider state coverage::
 
-    python collect.py --policy expert --episodes 50 --dart 0.15 --out data/round0
+    python collect.py --policy expert --episodes 50 --timeout-s 120 --dart 0.15 \
+        --out data/round0
+
+Scripted-baseline evaluation, 10-minute matches against the default bots::
+
+    python collect.py --policy expert --behaviors fighter --episodes 10 \
+        --bots default --stats-only --out out/baseline_default
 
 Student rollouts for DAgger. The student (composed checkpoint) drives, the
 expert labels every visited state, and all envs step in lockstep so each
-tick's student decisions are one batched vLLM call::
+tic's student decisions are one batched vLLM call::
 
     python collect.py --policy vllm --model ./doom-switch --episodes 30 \
         --beta 0.0 --out data/round1
@@ -15,12 +21,17 @@ tick's student decisions are one batched vLLM call::
 ``--policy random`` drives the same lockstep path with uniform random actions.
 It is a stat baseline, and a way to exercise the plumbing without a GPU.
 
+Every policy chooses the weapon through the expert's planner every
+``PLAN_EVERY_TICS`` (about 0.5 s). Tics while the player is dead need no
+decision and produce no row.
+
 Outputs in ``--out``:
 
-* ``<behavior>.jsonl``: one row per tic, ``{"text", "expert", "act", ...}``;
-  ``expert`` is the training label.
-* ``stats.jsonl``: one row per episode.
-* ``videos/<behavior>_ep<k>.mp4``: the first ``--record`` episodes per behavior.
+* ``<behavior>.jsonl``: one row per decided tic, ``{"text", "expert", "act",
+  "weapon", ...}``; ``expert`` is the training label, ``weapon`` the planner's
+  slot on tics where it ran (else null).
+* ``stats.jsonl``: one row per match.
+* ``videos/<behavior>_ep<k>.mp4``: the first ``--record`` matches per behavior.
 """
 
 from __future__ import annotations
@@ -37,11 +48,10 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from doom_env import ACTIONS, TIC_HZ, DoomEnv
-from expert import BEHAVIORS, Expert
+from doom_env import ACTIONS, BOT_SETS, MATCH_TICS, TIC_HZ, DoomEnv
+from expert import BEHAVIORS, PLAN_EVERY_TICS, Expert
 
 RESOLUTION = "640X480"  # one setting everywhere: collection, bench and demo
-SKILL = 3
 
 
 class _Noise:
@@ -70,22 +80,52 @@ def _writer(path: Path):
     )
 
 
-# ── Expert path: each worker runs whole episodes on its own ─────────────────────
-def _expert_episode(task: dict) -> dict:
-    env = DoomEnv(
+def _make_env(task: dict) -> DoomEnv:
+    return DoomEnv(
         seed=task["seed"],
         resolution=RESOLUTION,
         hud=True,
         timeout_tics=task["timeout"],
-        skill=task["skill"],
+        bots=task["bots"],
+        n_bots=task["n_bots"],
     )
+
+
+def _plan(expert: Expert, obs, behavior: str) -> int | None:
+    """The weapon planner's slot on its cadence, else None (keep pressing the last)."""
+    if obs.tick % PLAN_EVERY_TICS:
+        return None
+    return expert.weapon(obs, behavior)
+
+
+def _stats(task: dict, env: DoomEnv, **extra) -> dict:
+    return {
+        "behavior": task["behavior"],
+        "ep": task["ep"],
+        "seed": task["seed"],
+        "bots": task["bots"],
+        "policy": task["policy"],
+        **extra,
+        **env.stats.as_dict(),
+    }
+
+
+# ── Expert path: each worker runs whole matches on its own ──────────────────────
+def _expert_episode(task: dict) -> dict:
+    env = _make_env(task)
     expert, rng = Expert(), random.Random(task["seed"])
     noise = _Noise(task["dart"], rng)
     b = task["behavior"]
     obs = env.reset(seed=task["seed"])
     rows, video = [], _writer(Path(task["video"])) if task["video"] else None
     while not obs.done:
+        if video is not None:
+            video.append_data(env.frame())
+        if obs.dead:
+            obs = env.step("wait")
+            continue
         label = expert.act(obs, b)
+        weapon = _plan(expert, obs, b)
         act = noise(label)
         if task["keep_rows"]:
             rows.append(
@@ -96,45 +136,38 @@ def _expert_episode(task: dict) -> dict:
                     "text": obs.text,
                     "expert": label,
                     "act": act,
+                    "weapon": weapon,
                 }
             )
-        if video is not None:
-            video.append_data(env.frame())
-        obs = env.step(act)
+        obs = env.step(act, weapon=weapon)
     if video is not None:
         video.close()
     env.close()
-    stats = {
-        "behavior": b,
-        "ep": task["ep"],
-        "seed": task["seed"],
-        "policy": "expert",
-        **env.stats.as_dict(),
-    }
-    return {"rows": rows, "stats": stats}
+    return {"rows": rows, "stats": _stats(task, env)}
 
 
 # ── Lockstep path: the main process decides for every env each tick ─────────────
 def _lockstep_worker(conn, tasks: list[dict]) -> None:
     for task in tasks:
-        env = DoomEnv(
-            seed=task["seed"],
-            resolution=RESOLUTION,
-            hud=True,
-            timeout_tics=task["timeout"],
-            skill=task["skill"],
-        )
+        env = _make_env(task)
         expert, rng = Expert(), random.Random(task["seed"])
         b = task["behavior"]
         obs = env.reset(seed=task["seed"])
-        rows, agree = [], 0
+        rows, agree, decided = [], 0, 0
         video = _writer(Path(task["video"])) if task["video"] else None
         while not obs.done:
+            if video is not None:
+                video.append_data(env.frame())
+            if obs.dead:
+                obs = env.step("wait")
+                continue
             label = expert.act(obs, b)
+            weapon = _plan(expert, obs, b)
             conn.send(("state", obs.text, b))
             student = conn.recv()
             act = label if rng.random() < task["beta"] else student
             agree += student == label
+            decided += 1
             if task["keep_rows"]:
                 rows.append(
                     {
@@ -145,22 +178,14 @@ def _lockstep_worker(conn, tasks: list[dict]) -> None:
                         "expert": label,
                         "student": student,
                         "act": act,
+                        "weapon": weapon,
                     }
                 )
-            if video is not None:
-                video.append_data(env.frame())
-            obs = env.step(act)
+            obs = env.step(act, weapon=weapon)
         if video is not None:
             video.close()
         env.close()
-        stats = {
-            "behavior": b,
-            "ep": task["ep"],
-            "seed": task["seed"],
-            "policy": task["policy"],
-            "agreement": round(agree / max(1, env.stats.tics), 4),
-            **env.stats.as_dict(),
-        }
+        stats = _stats(task, env, agreement=round(agree / max(1, decided), 4))
         conn.send(("episode", {"rows": rows, "stats": stats}))
     conn.send(("done",))
 
@@ -201,32 +226,42 @@ def _run_lockstep(tasks: list[dict], workers: int, decide_batch, on_episode) -> 
 
 # ── Reporting ──────────────────────────────────────────────────────────────────
 def summarize(stats: list[dict]) -> str:
+    def per_min(key):
+        return lambda s: 60 * s[key] / max(1, s["seconds"])
+
     cols = [
-        ("kills", lambda s: s["kills"]),
-        ("dmg", lambda s: s["damage_taken"]),
-        ("dmg/min", lambda s: 60 * s["damage_taken"] / max(1, s["seconds"])),
-        ("pickups", lambda s: s["pickups"]),
-        ("pick/min", lambda s: 60 * s["pickups"] / max(1, s["seconds"])),
-        ("kills/min", lambda s: 60 * s["kills"] / max(1, s["seconds"])),
-        ("shots/min", lambda s: 60 * s["shots"] / max(1, s["seconds"])),
+        ("frags", lambda s: s["frags"]),
+        ("deaths", lambda s: s["deaths"]),
+        ("margin", lambda s: s["margin"]),
+        ("top%", lambda s: 100.0 * s["top"]),
+        ("rank", lambda s: s["rank"]),
+        ("best bot", lambda s: s["best_bot"][1]),
+        ("frags/min", per_min("frags")),
+        ("dealt/min", per_min("damage_dealt")),
+        ("taken/min", per_min("damage_taken")),
+        ("pick/min", per_min("pickups")),
         ("threat m", lambda s: s["threat_dist"]),
-        ("alive s", lambda s: s["seconds"]),
-        ("died%", lambda s: 100.0 * s["died"]),
     ]
     if any("agreement" in s for s in stats):
         cols.append(("agree%", lambda s: 100.0 * s.get("agreement", 0)))
-    head = f"{'behavior':<10} {'n':>3} " + " ".join(f"{c:>13}" for c, _ in cols)
+    head = f"{'behavior':<10} {'bots':<8} {'n':>3} " + " ".join(
+        f"{c:>13}" for c, _ in cols
+    )
     lines = [head, "-" * len(head)]
-    for b in sorted(
-        {s["behavior"] for s in stats}, key=lambda b: (b not in BEHAVIORS, b)
-    ):
-        ss = [s for s in stats if s["behavior"] == b]
+    groups = sorted(
+        {(s["behavior"], s["bots"]) for s in stats},
+        key=lambda g: (g[0] not in BEHAVIORS, g),
+    )
+    for b, bots in groups:
+        ss = [s for s in stats if s["behavior"] == b and s["bots"] == bots]
         cells = []
         for _, f in cols:
             vals = [f(s) for s in ss]
             sd = statistics.stdev(vals) if len(vals) > 1 else 0.0
             cells.append(f"{statistics.mean(vals):7.1f} ±{sd:5.1f}")
-        lines.append(f"{b:<10} {len(ss):>3} " + " ".join(f"{c:>13}" for c in cells))
+        lines.append(
+            f"{b:<10} {bots:<8} {len(ss):>3} " + " ".join(f"{c:>13}" for c in cells)
+        )
     return "\n".join(lines)
 
 
@@ -238,8 +273,12 @@ def main() -> None:
         "--behaviors", nargs="+", default=list(BEHAVIORS), choices=BEHAVIORS
     )
     ap.add_argument("--episodes", type=int, default=50, help="Per behavior")
+    ap.add_argument("--bots", default="default", choices=sorted(BOT_SETS))
+    ap.add_argument("--n-bots", type=int, default=7)
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
-    ap.add_argument("--timeout-s", type=float, default=60.0, help="Episode length cap")
+    ap.add_argument(
+        "--timeout-s", type=float, default=MATCH_TICS / TIC_HZ, help="Match length"
+    )
     ap.add_argument(
         "--dart", type=float, default=0.0, help="Noise-burst rate (expert only)"
     )
@@ -248,7 +287,6 @@ def main() -> None:
     )
     ap.add_argument("--record", type=int, default=0, help="MP4s per behavior")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--skill", type=int, default=SKILL, help="ViZDoom doom_skill 1-5")
     ap.add_argument(
         "--stats-only", action="store_true", help="Do not write per-tic rows"
     )
@@ -265,7 +303,8 @@ def main() -> None:
                     "ep": ep,
                     "seed": args.seed + 1000 * bi + ep,
                     "timeout": int(args.timeout_s * TIC_HZ),
-                    "skill": args.skill,
+                    "bots": args.bots,
+                    "n_bots": args.n_bots,
                     "dart": args.dart,
                     "beta": args.beta,
                     "policy": args.policy,
@@ -298,8 +337,9 @@ def main() -> None:
             n_rows += len(res["rows"])
         print(
             f"[{len(all_stats)}/{len(tasks)}] {s['behavior']:<9} ep{s['ep']:<3} "
-            f"kills {s['kills']:>2} dmg {s['damage_taken']:>4} pickups {s['pickups']:>3} "
-            f"alive {s['seconds']:>5.1f}s{' died' if s['died'] else ''}"
+            f"frags {s['frags']:>3} deaths {s['deaths']:>3} margin {s['margin']:>+4} "
+            f"rank {s['rank']} (best bot {s['best_bot'][0]} {s['best_bot'][1]}) "
+            f"pickups {s['pickups']:>3}"
             + (f" agree {100 * s['agreement']:.1f}%" if "agreement" in s else ""),
             flush=True,
         )
@@ -332,7 +372,7 @@ def main() -> None:
     table = summarize(all_stats)
     (args.out / "summary.txt").write_text(table + "\n")
     print(
-        f"\n{len(all_stats)} episodes, {n_rows} rows in {time.time() - t0:.0f}s -> {args.out}\n"
+        f"\n{len(all_stats)} matches, {n_rows} rows in {time.time() - t0:.0f}s -> {args.out}\n"
     )
     print(table)
 
