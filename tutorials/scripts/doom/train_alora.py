@@ -247,6 +247,12 @@ def main() -> None:
     ap.add_argument("--max-heldout", type=int, default=4000)
     ap.add_argument("--val-frac", type=float, default=0.08)
     ap.add_argument("--eval-every", type=int, default=500)
+    ap.add_argument("--weight-decay", type=float, default=0.0)
+    ap.add_argument(
+        "--keep-best",
+        action="store_true",
+        help="Also save the adapter with the lowest held-out soft CE (to <out>/best)",
+    )
     ap.add_argument("--grad-ckpt", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -420,7 +426,9 @@ def main() -> None:
     steps_per_epoch = math.ceil(len(train_rows) / args.batch)
     total = max(1, int(steps_per_epoch * args.epochs))
     opt = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=0.0
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=args.weight_decay,
     )
     warm = max(1, total // 20)
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -430,6 +438,8 @@ def main() -> None:
         * (1 + math.cos(math.pi * min(1.0, s / total))),
     )
     step, t0, run_loss, history = 0, time.time(), 0.0, []
+    train_curve: list[dict] = []  # training loss, every 50 steps
+    best = {"soft_ce": math.inf, "step": None}
     model.train()
     epoch = 0
     while step < total:
@@ -455,10 +465,14 @@ def main() -> None:
                     f"lr {sched.get_last_lr()[0]:.2e} {time.time() - t0:.0f}s",
                     flush=True,
                 )
+                train_curve.append({"step": step, "loss": round(run_loss / 50, 5)})
                 run_loss = 0.0
             if step % args.eval_every == 0 and val_rows:
                 ev, _ = evaluate(val_rows[:1000])
                 history.append({"step": step, **{k: ev[k] for k in ("acc", "soft_ce")}})
+                if args.keep_best and ev["soft_ce"] < best["soft_ce"]:
+                    best = {"soft_ce": ev["soft_ce"], "acc": ev["acc"], "step": step}
+                    model.save_pretrained(str(args.out / "best"))
                 print(
                     f"  held-out acc {ev['acc']:.4f} soft CE {ev['soft_ce']:.4f} "
                     f"(majority {ev['majority_baseline']:.4f})",
@@ -504,6 +518,8 @@ def main() -> None:
         "seconds": round(time.time() - t0, 1),
         "heldout": ev,
         "history": history,
+        "train_curve": train_curve,
+        "best": best if args.keep_best else None,
     }
     (args.out / "metrics.json").write_text(json.dumps(metrics, indent=1))
     print(

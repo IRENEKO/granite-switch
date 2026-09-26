@@ -25,6 +25,13 @@ soft labels: its whole action distribution). A **driver** chooses the actions:
 ``--stats-only`` with 10-minute matches is the evaluation (``--timeout-s 600``,
 the default). Tics while the player is dead need no decision and produce no row.
 
+The takeover test: ``--takeover-s 30`` hands the game from the student to the
+teacher after 30 s; ``--mark-s 30`` records frags, deaths and damage at 30 s in
+each stats row, so the teacher's play after a student prefix can be compared
+with its play after its own first 30 s (``--policy teacher --mark-s 30``). If
+the teacher plays as well from states the student leads it into, its labels on
+those states can be trusted.
+
 Outputs in ``--out``:
 
 * ``<style>.jsonl``: one row per decided tic: ``state`` (the prompt's current
@@ -166,6 +173,8 @@ class _Match:
         self.obs = self.env.reset(seed=task["seed"])
         self.teacher.reset()
         self.agree = self.decided = 0
+        self.mark_tick = task.get("mark")
+        self.mark: dict | None = None
 
     def labels(self):
         """Teacher labels for the current live tic, plus the row skeleton."""
@@ -189,6 +198,14 @@ class _Match:
     def record(self, frame: bool = True) -> None:
         self.taken.append(self.obs.counters["taken"])
         self.deaths.append(self.obs.counters["deaths"])
+        if self.mark_tick is not None and self.obs.tick == self.mark_tick:
+            s = self.env.stats
+            self.mark = {
+                "frags": s.frags,
+                "deaths": s.deaths,
+                "dealt": s.damage_dealt,
+                "best_bot": s.best_bot[1],
+            }
         if self.video is not None and frame:
             self.video.append_data(self.env.frame())
 
@@ -220,6 +237,15 @@ class _Match:
             **extra,
             **self.env.stats.as_dict(),
         }
+        if self.mark is not None:
+            s = self.env.stats
+            stats["mark"] = self.mark
+            stats["after_mark"] = {
+                "frags": s.frags - self.mark["frags"],
+                "deaths": s.deaths - self.mark["deaths"],
+                "dealt": s.damage_dealt - self.mark["dealt"],
+                "best_bot": s.best_bot[1] - self.mark["best_bot"],
+            }
         history = {"b": self.style, "ep": self.task["ep"], "entries": self.hist_all}
         return {"rows": self.rows, "history": history, "stats": stats}
 
@@ -263,6 +289,18 @@ def _lockstep_worker(conn, tasks: list[dict]) -> None:
                 continue
             move, weapon, plan, row = m.labels()
             row["state"] = state_text(m.obs)
+            takeover = task.get("takeover")
+            if takeover is not None and m.obs.tick >= takeover:
+                # The teacher plays from here, as it does on its own: sampling.
+                act = _sample(move, m.rng) if m.teacher.soft else row["expert"]
+                slot = None
+                if plan:
+                    slot = int(
+                        _sample(weapon, m.rng) if m.teacher.soft else row["weapon"]
+                    )
+                row["student"] = None
+                m.advance(act, slot, row)
+                continue
             new = m.hist_all[sent:]
             sent = len(m.hist_all)
             conn.send(("state", row["state"], new, m.style, plan))
@@ -436,6 +474,12 @@ def main() -> None:
         "--beta", type=float, default=0.0, help="DAgger: P(execute teacher label)"
     )
     ap.add_argument("--record", type=int, default=0, help="MP4s per behavior")
+    ap.add_argument(
+        "--takeover-s", type=float, help="Teacher plays after this many seconds (vllm)"
+    )
+    ap.add_argument(
+        "--mark-s", type=float, help="Record frags/deaths/damage at this time"
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
         "--stats-only", action="store_true", help="Do not write per-tic rows"
@@ -463,6 +507,10 @@ def main() -> None:
                     "dart": args.dart,
                     "beta": args.beta,
                     "policy": args.policy,
+                    "takeover": None
+                    if args.takeover_s is None
+                    else int(args.takeover_s * TIC_HZ),
+                    "mark": None if args.mark_s is None else int(args.mark_s * TIC_HZ),
                     "keep_rows": not args.stats_only,
                     "video": str(args.out / "videos" / f"{b}_ep{ep}.mp4")
                     if ep < args.record
