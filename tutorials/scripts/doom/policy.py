@@ -71,6 +71,7 @@ class Decision:
     cached_tokens: int = 0
     build_ms: float = 0.0  # prompt-id assembly (tokenizing the state)
     engine_ms: float = 0.0  # vLLM: submit -> output (prefill + one token)
+    probs: dict[str, float] = field(default_factory=dict)  # every action
 
 
 @dataclass
@@ -222,7 +223,8 @@ class ExpertPolicy:
     def decide(self, obs: Observation, adapter: str) -> Decision:
         t0 = time.perf_counter()
         action = self.expert.act(obs, adapter)
-        return Decision(action, [(action, 1.0)], (time.perf_counter() - t0) * 1000)
+        ms = (time.perf_counter() - t0) * 1000
+        return Decision(action, [(action, 1.0)], ms, probs={action: 1.0})
 
     def decide_many(
         self, obs: Observation, adapters: tuple[str, ...]
@@ -241,7 +243,7 @@ class VLLMPolicy:
         engine_loop: Drive ``LLMEngine.add_request/step`` directly instead of
             ``LLM.generate``. The latency test picks whichever is faster.
         prefix_caching: Keep on; the system prompt is then prefilled once.
-        logprobs_mode: ``processed_logprobs`` so the top-3 are over allowed
+        logprobs_mode: ``processed_logprobs`` so the probabilities are over allowed
             actions, renormalized.
         cudagraph_mode: ``FULL`` captures the whole forward, SWITCH kernels
             included, for prefill steps too; ``FULL_AND_PIECEWISE`` is vLLM's
@@ -309,7 +311,7 @@ class VLLMPolicy:
             max_tokens=1,
             temperature=0.0,
             allowed_token_ids=list(self.action_ids.values()),
-            logprobs=3,
+            logprobs=len(ACTIONS),  # the full distribution, for the heatmap
         )
         self.sp_route = SamplingParams(
             max_tokens=1,
@@ -356,7 +358,8 @@ class VLLMPolicy:
         return pairs
 
     def _decision(self, out, t0: float, t1: float, t2: float) -> Decision:
-        top = self._dist(out, self.id_to_action)[:3]
+        dist = self._dist(out, self.id_to_action)
+        top = dist[:3]
         action = self.id_to_action[out.outputs[0].token_ids[0]]
         n_prompt = len(out.prompt_token_ids)
         cached = out.num_cached_tokens or 0
@@ -368,6 +371,7 @@ class VLLMPolicy:
             cached,
             build_ms=(t1 - t0) * 1000,
             engine_ms=(t2 - t1) * 1000,
+            probs=dict(dist),
         )
 
     # ── Policy interface ───────────────────────────────────────────────────────

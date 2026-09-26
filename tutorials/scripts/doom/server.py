@@ -46,7 +46,7 @@ from fastapi.responses import FileResponse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from doom_env import ACTION_LABELS, TIC_HZ, TIC_MS, DoomEnv
+from doom_env import ACTION_LABELS, DISPLAY_ORDER, TIC_HZ, TIC_MS, DoomEnv
 from expert import BEHAVIORS, Expert
 from policy import make_policy
 
@@ -219,6 +219,9 @@ class GameLoop(threading.Thread):
         self.reaction = {m: deque(maxlen=200) for m in MODES}
         self.agree: deque[int] = deque(maxlen=1000)
         self.route_info: dict | None = None
+        # Game 0's per-tic action distribution since the last publish, rows in
+        # DISPLAY_ORDER, for the browser's heatmap.
+        self.heat: list[dict] = []
         self._resize(1)
 
     # Commands arrive from the websocket handler on the asyncio thread.
@@ -282,6 +285,7 @@ class GameLoop(threading.Thread):
                 out[g.index] = {
                     "action": a,
                     "top3": [[a, 1.0]],
+                    "probs": {a: 1.0},
                     "ms": g.state["expert_ms"],
                     "build_ms": 0.0,
                     "engine_ms": g.state["expert_ms"],
@@ -303,6 +307,7 @@ class GameLoop(threading.Thread):
             out[g.index] = {
                 "action": d.action,
                 "top3": [[a, round(p, 4)] for a, p in d.top3],
+                "probs": d.probs,
                 "ms": d.ms,
                 "build_ms": d.build_ms,
                 "engine_ms": d.engine_ms,
@@ -355,6 +360,7 @@ class GameLoop(threading.Thread):
                 if jpeg is not None:
                     self.publish("bytes", bytes([g.index]) + jpeg)
             self.tics.add(0.0)
+            self._record_heat(games[0], last_dec.get(0), 0 in decs)
 
             if now - last_pub >= 1.0 / 30:
                 last_pub = now
@@ -369,6 +375,19 @@ class GameLoop(threading.Thread):
                     next_t = time.perf_counter()  # fell behind: do not accrue debt
             else:
                 next_t = time.perf_counter()
+
+    def _record_heat(self, g: Game, d: dict | None, decided: bool) -> None:
+        """One heatmap column per tic. On a tic without a fresh decision (10 Hz
+        cadence) the previous distribution repeats, flagged by ``d=False``."""
+        probs = (d or {}).get("probs") or {}
+        self.heat.append(
+            {
+                "p": [round(probs.get(a, 0.0), 3) for a in DISPLAY_ORDER],
+                "b": BEHAVIORS.index(g.adapter),
+                "d": decided,
+            }
+        )
+        del self.heat[:-400]  # a stalled client must not grow this without bound
 
     def _publish(
         self, games: list[Game], last_dec: dict[int, dict], decided: bool
@@ -400,6 +419,9 @@ class GameLoop(threading.Thread):
             "latency": self.lat.summary(),
             "tics_per_s": self.tics.summary()["per_s"],
             "tic_ms": round(TIC_MS, 2),
+            "heat": self.heat,
+            "order": DISPLAY_ORDER,
+            "behaviors": BEHAVIORS,
             "reaction": rt,
             "agreement": round(sum(self.agree) / len(self.agree), 3)
             if self.agree
@@ -415,6 +437,7 @@ class GameLoop(threading.Thread):
                 for g in games
             ],
         }
+        self.heat = []
         self.publish("json", msg)
 
 

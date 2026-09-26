@@ -65,6 +65,22 @@ ACTION_LABELS = {
     "ar": "fire + aim right",
     "wait": "wait",
 }
+# Row order for probability heatmaps: combat, running, turning, strafing, other.
+DISPLAY_ORDER: tuple[str, ...] = (
+    "fire",
+    "al",
+    "ar",
+    "forward",
+    "fl",
+    "fr",
+    "left",
+    "right",
+    "sl",
+    "sr",
+    "back",
+    "wait",
+)
+assert sorted(DISPLAY_ORDER) == sorted(ACTIONS)
 
 TURN_DEG = 7.0  # left / right: fast turn in place
 VEER_DEG = 4.0  # fl / fr: turn while running

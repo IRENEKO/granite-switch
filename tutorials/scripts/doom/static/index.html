@@ -104,6 +104,11 @@
   .budget-note b { color: var(--text-pri); font-weight: 500; }
 
   canvas.spark { width: 100%; height: 70px; display: block; }
+  canvas.heat { width: 100%; height: 214px; display: block; }
+  .heat-legend { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-family: var(--mono); font-size: 10px; color: var(--text-help); }
+  .heat-legend .ramp { flex: 1; height: 8px; position: relative; }
+  .heat-legend .ramp span { position: absolute; top: 10px; transform: translateX(-50%); }
+  .heat-legend + .heat-ticks { height: 12px; }
 
   .bars { display: flex; flex-direction: column; gap: 6px; }
   .bar { display: grid; grid-template-columns: 120px 1fr 48px; gap: 8px; align-items: center; font-size: 13px; }
@@ -211,10 +216,14 @@
       </div>
 
       <div class="card">
-        <div class="eyebrow">Action <span class="r" id="agree"></span></div>
+        <div class="eyebrow">Action probabilities <span class="r" id="agree"></span></div>
         <div class="action-now" id="action-now">–</div>
-        <div class="bars" id="bars"></div>
-        <div class="small" id="shadow" style="margin-top:8px"></div>
+        <canvas class="heat" id="heat" aria-label="Probability of every action over the last 10 seconds"></canvas>
+        <div class="heat-legend"><span>p</span><div class="ramp" id="heat-ramp"></div></div>
+        <div class="heat-ticks"></div>
+        <div class="small" style="margin-top:4px">One column per tic, newest at the right, last 10 s. Top strip: active behavior.
+          Bottom marks: tics with a fresh decision.</div>
+        <div class="small" id="shadow" style="margin-top:6px"></div>
       </div>
 
       <div class="card">
@@ -273,7 +282,13 @@
     ws.onmessage = (ev) => {
       if (ev.data instanceof ArrayBuffer) { drawFrame(ev.data); return; }
       const msg = JSON.parse(ev.data);
-      if (msg.type === 'tick') { latest = msg; }
+      if (msg.type === 'tick') {
+        // Every message carries the tics since the last one; take them all
+        // here, since render() only sees the latest message per frame.
+        if (!heatOrder && msg.order) heatInit(msg.order, msg.behaviors);
+        if (heatOrder) (msg.heat || []).forEach(heatPush);
+        latest = msg;
+      }
       else if (msg.type === 'route') { showRoute(msg); }
     };
   }
@@ -350,8 +365,7 @@
     if (d.ms !== undefined) { spark.push(d.ms); if (spark.length > 240) spark.shift(); drawSpark(m.tic_ms); }
 
     $('action-now').innerHTML = `${m.action_label}<span class="tok">${m.action}</span>`;
-    const top = (d.top3 || []);
-    $('bars').innerHTML = top.map(([a, p]) => `<div class="bar"><span class="n">${LABELS[a] || a}</span><span class="t"><i style="width:${(100 * p).toFixed(1)}%"></i></span><span class="p">${(100 * p).toFixed(1)}%</span></div>`).join('');
+    drawHeat();
     $('agree').textContent = m.agreement !== null && m.agreement !== undefined ? `teacher agreement ${(100 * m.agreement).toFixed(0)}%` : (m.policy === 'expert' ? 'teacher driving' : '');
     $('shadow').textContent = m.shadow_actions ? 'Same state, other behaviors: ' + Object.entries(m.shadow_actions).filter(([k]) => k !== m.adapter).map(([k, v]) => `${k} → ${LABELS[v] || v}`).join(' · ') : '';
 
@@ -370,6 +384,62 @@
       tiles[i].a.textContent = t.adapter; tiles[i].a.style.borderLeft = `3px solid ${COLORS[t.adapter]}`;
       tiles[i].s.textContent = `${t.action} · ${t.kills}k ${t.pickups}p`;
     });
+  }
+
+  // ── Action-probability heatmap ────────────────────────────────────────
+  // Offscreen canvas at one pixel per (tic, action); scaled up without
+  // smoothing when drawn. Row 0 is the behavior strip, the last row marks
+  // tics that had a fresh decision.
+  const WIN = 350;  // 10 s of tics
+  const HEAT_LABELS = { fire: 'fire', al: 'fire+aim L', ar: 'fire+aim R', forward: 'forward', fl: 'fwd+left', fr: 'fwd+right',
+                        left: 'turn left', right: 'turn right', sl: 'strafe L', sr: 'strafe R', back: 'back', wait: 'wait' };
+  const BEHAVIOR_RGB = { hunter: [250, 77, 86], survivor: [8, 189, 186], scavenger: [210, 161, 6] };
+  const STOPS = [[0, [22, 22, 22]], [0.35, [0, 45, 156]], [0.7, [15, 98, 254]], [1, [200, 228, 255]]];
+  const heatOff = document.createElement('canvas');
+  let heatCtx = null, heatOrder = null, heatBehaviors = null, heatCount = 0;
+  function cmap(p) {
+    const t = Math.sqrt(Math.max(0, Math.min(1, p)));  // sqrt so runner-up actions stay visible
+    for (let i = 1; i < STOPS.length; i++) {
+      const [t1, c1] = STOPS[i], [t0, c0] = STOPS[i - 1];
+      if (t <= t1) { const f = (t - t0) / (t1 - t0); return c0.map((v, k) => Math.round(v + f * (c1[k] - v))); }
+    }
+    return STOPS[STOPS.length - 1][1];
+  }
+  function heatInit(order, behaviors) {
+    heatOrder = order; heatBehaviors = behaviors; heatCount = 0;
+    heatOff.width = WIN; heatOff.height = order.length + 2;
+    heatCtx = heatOff.getContext('2d');
+    heatCtx.fillStyle = '#161616'; heatCtx.fillRect(0, 0, heatOff.width, heatOff.height);
+    const ramp = $('heat-ramp');
+    ramp.style.background = `linear-gradient(90deg, ${[0, 0.35, 0.7, 1].map((t) => `rgb(${cmap(t * t).join(',')}) ${100 * t}%`).join(', ')})`;
+    ramp.innerHTML = [0, 0.05, 0.25, 0.5, 1].map((p) => `<span style="left:${100 * Math.sqrt(p)}%">${p}</span>`).join('');
+  }
+  function heatPush(col) {
+    let x = heatCount;
+    if (heatCount >= WIN) { heatCtx.drawImage(heatOff, -1, 0); x = WIN - 1; }  // slide once full
+    heatCount++;
+    const h = heatOff.height, img = heatCtx.createImageData(1, h);
+    const put = (row, rgb) => { img.data.set([...rgb, 255], row * 4); };
+    put(0, BEHAVIOR_RGB[heatBehaviors[col.b]] || [244, 244, 244]);
+    col.p.forEach((p, i) => put(i + 1, cmap(p)));
+    put(h - 1, col.d ? [244, 244, 244] : [22, 22, 22]);
+    heatCtx.putImageData(img, x, 0);
+  }
+  function drawHeat() {
+    if (!heatOrder) return;
+    const c = $('heat'), dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+    if (c.width !== w * dpr) { c.width = w * dpr; c.height = h * dpr; }
+    const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+    g.imageSmoothingEnabled = false;
+    const gut = 84, n = heatOrder.length, stripH = 6, markH = 4, axisH = 14;
+    const rowH = (h - stripH - markH - axisH - 6) / n, cw = w - gut;
+    g.drawImage(heatOff, 0, 0, WIN, 1, gut, 0, cw, stripH);
+    g.drawImage(heatOff, 0, 1, WIN, n, gut, stripH + 3, cw, n * rowH);
+    g.drawImage(heatOff, 0, n + 1, WIN, 1, gut, stripH + 3 + n * rowH + 3, cw, markH);
+    g.font = '11px "IBM Plex Mono", monospace'; g.textBaseline = 'middle'; g.fillStyle = '#c6c6c6';
+    heatOrder.forEach((a, i) => g.fillText(HEAT_LABELS[a] || a, 0, stripH + 3 + (i + 0.5) * rowH));
+    g.fillStyle = '#a8a8a8'; g.textBaseline = 'bottom';
+    g.fillText('−10 s', gut, h); g.fillText('now', w - 24, h);
   }
 
   function drawSpark(tic) {
