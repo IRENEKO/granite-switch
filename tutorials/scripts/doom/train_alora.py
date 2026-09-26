@@ -19,8 +19,15 @@ Adapters and their labels (rows from ``collect.py``):
 * ``router``: rows from ``router_data.py`` (instruction, label); no history.
 
 ``--kind lora`` trains a plain LoRA on the same data and prompts: the baseline
-the aLoRA is compared against. Settings follow IBM's shipped aLoRAs: rank 32
-on every linear layer.
+the aLoRA is compared against. ``--kind sr`` trains a Shadow Residual adapter
+(github.ibm.com/generative-computing/shadow-residual, its ``src`` on
+``PYTHONPATH``): a second, adapter stream through every layer that reads the
+frozen base stream's K/V, with LoRA on Q, O and the MLP (never K/V) plus a
+per-layer low-rank cross-stream from the base. The adapter never writes K/V, so
+with a one-token answer only the last position's adapter stream matters, and
+training it always-active is exactly inference with the control token on the
+last prompt token. Settings follow IBM's shipped aLoRAs: rank 32 on every
+linear layer (for SR, every linear layer but K and V).
 
 ::
 
@@ -50,6 +57,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from history import PROBE_WORDS, History
 from policy import (
+    _EOR,
     ARMS,
     CRITIC,
     DANGER_LEVELS,
@@ -65,6 +73,7 @@ from policy import (
 
 PROBE = "probe"
 DEFAULT_TARGETS = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+SR_CROSS = "cross_stream"
 VOCAB = {**OUTPUTS, PROBE: PROBE_WORDS}
 
 
@@ -211,7 +220,16 @@ def main() -> None:
         help="Row files to read (default: the adapter's own, "
         "or every style for arms/critic/probe)",
     )
-    ap.add_argument("--kind", choices=("alora", "lora"), default="alora")
+    ap.add_argument("--kind", choices=("alora", "lora", "sr"), default="alora")
+    ap.add_argument(
+        "--cross-rank", type=int, default=32, help="SR: rank of the cross-stream"
+    )
+    ap.add_argument(
+        "--init",
+        type=Path,
+        help="Warm-start from this adapter (e.g. the previous DAgger round's); "
+        "its config (kind, rank, targets) is used as saved",
+    )
     ap.add_argument("--base", default="ibm-granite/granite-4.1-3b")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--rank", type=int, default=32)
@@ -292,27 +310,57 @@ def main() -> None:
         flush=True,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(args.base, dtype=torch.bfloat16).to(
-        device
-    )
-    if args.grad_ckpt:
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
-    extra = (
-        {"alora_invocation_tokens": alora_invocation_ids(tok)}
-        if args.kind == "alora"
-        else {}
-    )
-    cfg = LoraConfig(
-        task_type="CAUSAL_LM",
-        r=args.rank,
-        lora_alpha=args.alpha,
-        lora_dropout=args.dropout,
-        target_modules=args.targets.split(","),
-        bias="none",
-        **extra,
-    )
-    model = get_peft_model(model, cfg)
+    if args.kind == "sr":
+        if args.init is not None:
+            raise SystemExit("--init is not supported for sr yet")
+        from shadow_residual.training.factory import get_shadow_residual_peft_model
+
+        # K/V always come from the base stream: no LoRA can land there.
+        targets = [t for t in args.targets.split(",") if t not in ("k_proj", "v_proj")]
+        cfg = LoraConfig(
+            task_type="CAUSAL_LM",
+            r=args.rank,
+            lora_alpha=args.alpha,
+            lora_dropout=args.dropout,
+            target_modules=[*targets, SR_CROSS],
+            rank_pattern={SR_CROSS: args.cross_rank},
+            bias="none",
+        )
+        model = get_shadow_residual_peft_model(
+            args.base, cfg, torch_dtype=torch.bfloat16
+        ).to(device)
+        if args.grad_ckpt:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            model.enable_input_require_grads()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base, dtype=torch.bfloat16
+        ).to(device)
+        if args.grad_ckpt:
+            model.gradient_checkpointing_enable()
+            model.enable_input_require_grads()
+        if args.init is not None:
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(model, str(args.init), is_trainable=True)
+        else:
+            extra = (
+                {"alora_invocation_tokens": alora_invocation_ids(tok)}
+                if args.kind == "alora"
+                else {}
+            )
+            cfg = LoraConfig(
+                task_type="CAUSAL_LM",
+                r=args.rank,
+                lora_alpha=args.alpha,
+                lora_dropout=args.dropout,
+                target_modules=args.targets.split(","),
+                bias="none",
+                **extra,
+            )
+            model = get_peft_model(model, cfg)
     model.print_trainable_parameters()
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
@@ -422,6 +470,15 @@ def main() -> None:
 
     args.out.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(args.out))
+    if args.kind == "sr":
+        # What the Granite Switch composer reads to place an SR control token:
+        # it replaces this single token, the last one of the prompt.
+        path = args.out / "adapter_config.json"
+        acfg = json.loads(path.read_text())
+        acfg["last_context_token"] = _EOR
+        acfg["last_context_token_id"] = tok.encode(_EOR, add_special_tokens=False)[0]
+        acfg["share_moe_routing"] = True  # no-op on a dense base; recorded by SR
+        path.write_text(json.dumps(acfg, indent=2))
     ev, probs = evaluate(val_rows)
     with open(args.out / "heldout_preds.jsonl", "w") as f:
         for r, q in zip(val_rows, probs):

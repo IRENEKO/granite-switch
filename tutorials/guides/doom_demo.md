@@ -137,11 +137,35 @@ sampling from its distribution:
 | 30M | 6 | 27.8 | 6.2 | 34.3 | 2 of 6 |
 | 41M | 12 | 43.0 ± 8.3 | 10.2 | 29.8 | 9 of 12 |
 | **51M** | **12** | **92.8 ± 7.7** | **19.2** | **27.8** | **12 of 12** |
+| 61M-174M (12 evaluations) | 6 each | 97-117 | 11-20 | 20-28 | 6 of 6 each |
 
 Kickstarting holds it near the scripted player until the imitation term fades.
 Within 10M steps after that it triples its frags: the scripted fighter gets 23.4
-per match, this teacher 92.8. Playing its most likely action instead of sampling
-gives 84.5 ± 35.8 frags, top in 11 of 12, so the students sample too.
+per match, this teacher 92.8. From 61M steps it plateaus at about 100-117 frags,
+with the bots' best falling to 20-28 as it takes their frags. The students are
+distilled from the 51M-step checkpoint. Playing its most likely action instead
+of sampling gives 84.5 ± 35.8 frags, top in 11 of 12, so the students sample too.
+
+**Does reacting every tic matter for this player?** A rerun of
+[`reaction_sweep.py`](../scripts/doom/reaction_sweep.py) with the 51M-step
+teacher (20 two-minute games per row, same seeds across rows; "margin" is frags
+ahead of the best bot):
+
+| Condition | Fighter frags/min | Deaths/min | Margin |
+|---|---:|---:|---:|
+| Every tic, no delay (the demo: decisions well under a tic) | 9.09 ± 0.57 | 1.93 | +10.2 |
+| Every tic, 1-tic delay | 6.46 ± 0.49 | 2.26 | +5.2 |
+| Every tic, 3-tic delay (100 ms) | 2.89 ± 0.41 | 2.51 | -3.0 |
+| 10 Hz, no delay | 3.60 ± 0.49 | 2.14 | -1.7 |
+| 10 Hz, 3-tic delay (Jev-like) | 0.33 ± 0.15 | 2.04 | -8.2 |
+
+One tic of staleness costs this player 29% of its frags. At 10 Hz with 100 ms of
+latency it stops scoring and falls behind the bots. The scripted teacher was
+much less sensitive (in round 0, staleness above a tic halved its kills). One
+reason is that the RL teacher was trained to act every tic with no delay and
+never saw one, so the table overstates what a player trained for 10 Hz would
+lose. It is the right table for this demo: the model imitates exactly this
+player.
 
 The styles separate in the intended directions (51M steps, 6 matches each for
 cautious and collector):
@@ -151,6 +175,85 @@ cautious and collector):
 | fighter | 92.8 | 19.2 | 16.1 |
 | cautious | 84.0 | **14.8** | 18.0 |
 | collector | 84.2 | 17.0 | **21.2** |
+
+### Stage 3: distilling the teacher into Granite (in progress)
+
+The 51M-step teacher plays 40 two-minute matches per style. Every live tic
+becomes a training row: its history (rebuilt from the match's stream), the
+state, and the teacher's whole move distribution. Planner tics also get its
+weapon distribution. The critic's label is the outcome of the next second.
+
+Adapters are rank 32 on every linear layer, α = rank, lr 1e-4, and use about
+50k examples each. On held-out matches:
+
+| Adapter | Agreement with the teacher's top choice | Majority baseline |
+|---|---:|---:|
+| fighter | 0.597 | 0.163 |
+| cautious | 0.614 | 0.146 |
+| collector | 0.583 | 0.177 |
+| arms (weapon planner) | 0.736 | 0.352 |
+| critic (danger in the next second) | 0.795, AUC 0.790 for "any damage" | 0.795 |
+| router | 0.933 | 0.333 |
+
+Top-choice agreement is capped by the teacher itself: its most likely action
+carries 47% on average (entropy 1.60 nats). The fighter's soft cross-entropy of
+1.85 nats is about 0.25 nats above that floor.
+
+**The first student beats the bots, but at 65% of the teacher's margin.** It is
+composed from these six aLoRAs and samples like the teacher. In 8 ten-minute
+matches per style against the default bots:
+
+| Student (sampling) | Frags | Deaths | Best bot | Margin | Top frag count |
+|---|---:|---:|---:|---:|---:|
+| fighter | 71.8 ± 15.1 | 16.9 | 29.5 | +42.2 | 8 of 8 |
+| cautious | 61.1 ± 9.7 | 15.1 | 31.5 | +29.6 | 8 of 8 |
+| collector | 66.6 ± 12.4 | 16.1 | 25.2 | +41.4 | 8 of 8 |
+| fighter, greedy | 36.8 ± 22.5 | 8.1 | 31.6 | +5.1 | 5 of 8 |
+
+The gate is 80% of the teacher's +65 margin, and the fighter reaches +42.2
+(65%). It also looks less smart than its score suggests, especially early in a
+match and on bad spawns. On six new seeds it scored 1.8 frags in the first
+minute; on the evaluation seeds it scored 4.8, against the teacher's 6.8. It
+deals half the teacher's damage (665 vs 1,292 per minute). Lowering the sampling
+temperature does not help (0.7 to 1.0 all score the same within noise). So the
+gap is in the decisions: imperfect imitation of a stochastic teacher compounds
+over the several tics that aiming takes. The fix under way is DAgger. The
+student plays, the teacher labels the states the student reaches (on those
+states the student's action matches the teacher's top choice 33% of the time,
+against 47% for the teacher's own samples), and the adapters are fine-tuned on
+all the data.
+
+Composed and PEFT agree on 99.6-99.97% of held-out states where PEFT's top
+choice leads by at least 0.05 (mean total-variation distance 0.005-0.018).
+Overall argmax agreement for the style adapters is 95.9-96.3%. The gap is
+near-ties in flat distributions.
+
+**aLoRA against LoRA and Shadow Residual on the same data.** The probe is a
+history-only question: where, relative to the current heading, was the last
+bot that appears in the history? It is asked only when none is on screen and
+the state line's 5-second enemy memory has expired. All numbers are final and
+use the full held-out set:
+
+| | aLoRA r32 | aLoRA r64 | aLoRA r128 | Shadow Residual (cross-stream 32 / 96) | LoRA r32 |
+|---|---:|---:|---:|---:|---:|
+| probe accuracy (majority 0.474) | 0.686 | 0.672 | 0.640 | 0.628 / 0.657 | **0.902** |
+| fighter agreement | 0.597 | | | 0.568 (step ~2000) | **0.673** |
+| critic AUC, damage in 1 s | 0.790 | | | | 0.801 |
+
+- **aLoRA and SR can tell whether a bot appears in the history, but not where.**
+  On the probe's `wait` class (no bot in the last 10 s) both are at 100%. On
+  the four directions, aLoRA is at 27-50% (chance is 25%) and LoRA at 75-85%.
+  Finding the direction takes arithmetic across fields: the old entry's heading
+  and bearing against the current heading. LoRA can encode that into the
+  history tokens as it reads them. aLoRA and SR must do it at the last few
+  positions against fixed base-model keys and values.
+- **Rank doesn't fix it:** 64 and 128 are no better than 32. The limit is
+  structural. It is the same property that makes aLoRA cheap (Stage 1): the
+  history is pure base-model KV, so every adapter can share it and none can
+  reshape it.
+- The SR runs use the same lr 1e-4 and α = rank as the others. That is a
+  quarter of the effective step size of SR's own recipe (lr 2e-4, α = 2r), so
+  the SR numbers are provisional until a learning-rate sweep.
 
 Two measurement notes on stage 1. vLLM 0.19.1 fails with "scheduler_metadata must have
 shape (metadata_size)" on steps larger than the largest CUDA-graph capture

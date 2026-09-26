@@ -29,7 +29,9 @@ several adapters read the same state in one step.
 A checkpoint composed from **LoRA** adapters (the baseline that aLoRA is
 compared against) puts the control token at position 0 instead, in place of the
 first ``<|start_of_role|>``, as the composed chat template does. Every adapter
-then has its own KV from the first token on, and nothing is shared.
+then has its own KV from the first token on, and nothing is shared. A **Shadow
+Residual** checkpoint puts it last: it replaces the final ``<|end_of_role|>``,
+so the adapter stream runs on that one position and reads only base K/V.
 
 Prompt ids are assembled directly each tick, which skips Jinja rendering.
 ``python policy.py --check-template <model_dir>`` confirms the ids are identical
@@ -176,14 +178,19 @@ def state_text(obs: Observation) -> str:
 class PromptBuilder:
     """Pre-tokenized prompt pieces, joined with the fresh text each tic.
 
-    ``adapter=None`` gives the base-model prompt (what PEFT trains on). For an
-    aLoRA, the control token takes the place of the ``<|start_of_role|>`` that
-    opens the assistant header, exactly as the composed chat template renders an
-    aLoRA whose invocation sequence is ``<|start_of_role|>assistant<|end_of_role|>``.
-    For a LoRA (``lora=True``) it takes the place of the first
-    ``<|start_of_role|>``, at position 0. Either way the switch gives the control
-    token ``<|start_of_role|>``'s embedding at runtime, so the model sees the
-    sequence it was trained on.
+    ``adapter=None`` gives the base-model prompt (what PEFT trains on). The
+    control token's place follows the composed chat template (``placement``):
+
+    * ``alora``: it takes the place of the ``<|start_of_role|>`` that opens the
+      assistant header (an aLoRA whose invocation sequence is
+      ``<|start_of_role|>assistant<|end_of_role|>``);
+    * ``lora``: it takes the place of the first ``<|start_of_role|>``, at
+      position 0;
+    * ``sr``: it takes the place of the final ``<|end_of_role|>`` (Shadow
+      Residual's ``last_context_token``).
+
+    Either way the switch gives the control token the displaced token's
+    embedding at runtime, so the model sees the sequence it was trained on.
 
     ``align=False`` drops the block padding (for the chat-template check).
     """
@@ -194,12 +201,13 @@ class PromptBuilder:
         system: str,
         adapters: tuple[str, ...] = (),
         *,
-        lora: bool = False,
+        placement: str = "alora",
         align: bool = True,
         block: int = BLOCK,
     ):
         self.tok = tokenizer
-        self.lora = lora
+        self.placement = placement
+        self.lora = placement == "lora"
         self.block = block if align else 0
         self.pad_id = single_token_id(tokenizer, PAD)
         body = self._enc(f"system{_EOR}{system}{_EOT}\n{_SOR}user{_EOR}")
@@ -208,9 +216,12 @@ class PromptBuilder:
         self.suffix = {None: base_suffix}
         for a in adapters:
             ctl = self._enc(control_token(a))
-            if lora:
+            if placement == "lora":
                 self.head[a] = ctl + body
                 self.suffix[a] = base_suffix
+            elif placement == "sr":
+                self.head[a] = self.head[None]
+                self.suffix[a] = self._enc(f"{_EOT}\n{_SOR}assistant") + ctl
             else:
                 self.head[a] = self.head[None]
                 self.suffix[a] = self._enc(f"{_EOT}\n{control_token(a)}assistant{_EOR}")
@@ -244,17 +255,24 @@ def alora_invocation_ids(tokenizer) -> list[int]:
     return tokenizer.encode(f"{_SOR}assistant{_EOR}", add_special_tokens=False)
 
 
-def is_lora_checkpoint(tokenizer) -> bool:
-    """True if the composed chat template places control tokens at position 0."""
-    if control_token(BEHAVIORS[0]) not in tokenizer.get_vocab():
-        return False
+def adapter_placement(tokenizer) -> str:
+    """Where the composed chat template puts control tokens: ``alora`` (before
+    the assistant header), ``lora`` (position 0), ``sr`` (last token), or
+    ``base`` for a tokenizer without them."""
+    ctl = control_token(BEHAVIORS[0])
+    if ctl not in tokenizer.get_vocab():
+        return "base"
     rendered = tokenizer.apply_chat_template(
         [{"role": "user", "content": "x"}],
         add_generation_prompt=True,
         tokenize=False,
         adapter_name=BEHAVIORS[0],
     )
-    return rendered.startswith(control_token(BEHAVIORS[0]))
+    if rendered.startswith(ctl):
+        return "lora"
+    if rendered.endswith(ctl):
+        return "sr"
+    return "alora"
 
 
 def check_template(model_dir: str, games: list[tuple[str, str]], routes: list[str]):
@@ -266,12 +284,14 @@ def check_template(model_dir: str, games: list[tuple[str, str]], routes: list[st
 
     tok = AutoTokenizer.from_pretrained(model_dir)
     composed = control_token(BEHAVIORS[0]) in tok.get_vocab()
-    lora = is_lora_checkpoint(tok)
+    placement = adapter_placement(tok) if composed else "alora"
     game_names = (*GAME_ADAPTERS, None) if composed else (None,)
     route_names = (ROUTER, None) if composed else (None,)
     adapters = ADAPTERS if composed else ()
-    pb = PromptBuilder(tok, SYSTEM_PROMPT, adapters, lora=lora, align=False)
-    rb = PromptBuilder(tok, ROUTER_SYSTEM_PROMPT, adapters, lora=lora, align=False)
+    pb = PromptBuilder(tok, SYSTEM_PROMPT, adapters, placement=placement, align=False)
+    rb = PromptBuilder(
+        tok, ROUTER_SYSTEM_PROMPT, adapters, placement=placement, align=False
+    )
 
     def rendered_ids(system: str, user: str, a: str | None) -> tuple[list[int], str]:
         msgs = [
@@ -295,7 +315,7 @@ def check_template(model_dir: str, games: list[tuple[str, str]], routes: list[st
             ref, r = rendered_ids(ROUTER_SYSTEM_PROMPT, text, a)
             assert rb.ids(text, a) == ref, f"adapter={a}\n{r!r}"
     check_output_tokens(tok)
-    kind = "LoRA" if lora else "aLoRA"
+    kind = {"lora": "LoRA", "sr": "Shadow Residual", "alora": "aLoRA"}[placement]
     what = f"{kind} adapters {', '.join(ADAPTERS)} and base" if composed else "base"
     print(
         f"OK: prompt ids match apply_chat_template for {what} on {len(games)} "
@@ -438,7 +458,7 @@ class VLLMPolicy:
         align: bool = True,
         max_num_seqs: int = 16,
         gpu_memory_utilization: float = 0.5,
-        max_model_len: int = 2048,
+        max_model_len: int = 4096,  # 10 s of eventful history can pass 2k tokens
         logprobs_mode: str = "processed_logprobs",
         enforce_eager: bool = False,
         warmup: int = 20,
@@ -480,13 +500,15 @@ class VLLMPolicy:
         )
         self.tok = self.llm.get_tokenizer()
         self.base_model = base_model
-        self.lora = not base_model and is_lora_checkpoint(self.tok)
+        self.placement = "base" if base_model else adapter_placement(self.tok)
+        self.lora = self.placement == "lora"
         adapters = () if base_model else ADAPTERS
+        place = "alora" if base_model else self.placement
         self.pb = PromptBuilder(
-            self.tok, SYSTEM_PROMPT, adapters, lora=self.lora, align=align
+            self.tok, SYSTEM_PROMPT, adapters, placement=place, align=align
         )
         self.rb = PromptBuilder(
-            self.tok, ROUTER_SYSTEM_PROMPT, adapters, lora=self.lora, align=False
+            self.tok, ROUTER_SYSTEM_PROMPT, adapters, placement=place, align=False
         )
         self.vocab = {a: vocab_ids(self.tok, a) for a in ADAPTERS}
         self.words = {a: {i: w for w, i in v.items()} for a, v in self.vocab.items()}
