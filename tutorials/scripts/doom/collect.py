@@ -213,7 +213,11 @@ class _Match:
         """Apply ``action`` for this tic; history and bookkeeping follow."""
         if row is not None:
             row["act"] = action
-            if self.task["keep_rows"]:
+            every = self.task.get("row_every", 1)
+            # Keep every k-th tic, and every planner tic (the arms adapter's rows).
+            if self.task["keep_rows"] and (
+                row["t"] % every == 0 or row["weapon"] is not None
+            ):
                 self.rows.append(row)
         entry = self.hist.observe(self.obs, None if self.obs.dead else action)
         if entry is not None:
@@ -232,6 +236,7 @@ class _Match:
             "ep": self.task["ep"],
             "seed": self.task["seed"],
             "bots": self.task["bots"],
+            "n_bots": self.task["n_bots"],
             "policy": self.task["policy"],
             "teacher": self.task["teacher"],
             **extra,
@@ -461,8 +466,24 @@ def main() -> None:
         "--behaviors", nargs="+", default=list(BEHAVIORS), choices=BEHAVIORS
     )
     ap.add_argument("--episodes", type=int, default=50, help="Per behavior")
-    ap.add_argument("--bots", default="default", choices=sorted(BOT_SETS))
+    ap.add_argument(
+        "--bots",
+        default="default",
+        choices=[*sorted(BOT_SETS), "all"],
+        help="A bot tier, or 'all' for a random tier per match",
+    )
     ap.add_argument("--n-bots", type=int, default=7)
+    ap.add_argument(
+        "--n-bots-min", type=int, help="Random bot count per match in [min, --n-bots]"
+    )
+    ap.add_argument(
+        "--timeout-min-s",
+        type=float,
+        help="Random match length per match in [min, --timeout-s]",
+    )
+    ap.add_argument(
+        "--row-every", type=int, default=1, help="Keep every k-th tic's row"
+    )
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument(
         "--timeout-s", type=float, default=MATCH_TICS / TIC_HZ, help="Match length"
@@ -495,14 +516,28 @@ def main() -> None:
     tasks = []
     for bi, b in enumerate(args.behaviors):
         for ep in range(args.episodes):
+            seed = args.seed + 1000 * bi + ep
+            rng = random.Random(seed)  # per-match variety, reproducible
+            tier = rng.choice(sorted(BOT_SETS)) if args.bots == "all" else args.bots
+            n_bots = (
+                rng.randint(args.n_bots_min, args.n_bots)
+                if args.n_bots_min
+                else args.n_bots
+            )
+            secs = (
+                rng.uniform(args.timeout_min_s, args.timeout_s)
+                if args.timeout_min_s
+                else args.timeout_s
+            )
             tasks.append(
                 {
                     "behavior": b,
                     "ep": ep,
-                    "seed": args.seed + 1000 * bi + ep,
-                    "timeout": int(args.timeout_s * TIC_HZ),
-                    "bots": args.bots,
-                    "n_bots": args.n_bots,
+                    "seed": seed,
+                    "timeout": int(secs * TIC_HZ),
+                    "bots": tier,
+                    "n_bots": n_bots,
+                    "row_every": args.row_every,
                     "teacher": teacher,
                     "dart": args.dart,
                     "beta": args.beta,

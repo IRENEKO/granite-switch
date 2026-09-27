@@ -44,6 +44,7 @@ row), which ``build_model.py verify`` compares against the composed checkpoint.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -84,14 +85,18 @@ class Stream:
 
     def __init__(self, entries: list[str], tok):
         h = History(tok)
-        self.starts, self.entry_ids = [0], []
+        self.starts, self.entry_ids, self.cum = [0], [], [0]
         for e in entries:
             h.append(e)
             self.starts.append(len(self.entry_ids) + 1 - len(h.entries))
             self.entry_ids.append(h.entry_ids[-1])
+            self.cum.append(self.cum[-1] + len(h.entry_ids[-1]))
 
     def ids(self, n: int) -> list[int]:
         return [i for e in self.entry_ids[self.starts[n] : n] for i in e]
+
+    def length(self, n: int) -> int:
+        return self.cum[n] - self.cum[self.starts[n]]
 
 
 def row_target(r: dict, adapter: str) -> dict[str, float] | None:
@@ -153,10 +158,24 @@ def split_by_episode(rows: list, val_frac: float, seed: int) -> tuple[list, list
     ]
 
 
-def batches(items: list, size: int, shuffle: bool, seed: int):
+def batches(items: list, size: int, shuffle: bool, seed: int, lengths=None):
+    """Batches of ``size``. With ``lengths``, rows are bucketed: shuffled, cut
+    into chunks of 50 batches, sorted by length within a chunk, and the batches
+    shuffled, so a batch holds prompts of similar length (less padding)."""
+    rng = random.Random(seed)
     idx = list(range(len(items)))
     if shuffle:
-        random.Random(seed).shuffle(idx)
+        rng.shuffle(idx)
+    if shuffle and lengths is not None:
+        chunk = size * 50
+        groups = []
+        for c in range(0, len(idx), chunk):
+            part = sorted(idx[c : c + chunk], key=lengths.__getitem__)
+            groups += [part[i : i + size] for i in range(0, len(part), size)]
+        rng.shuffle(groups)
+        for g in groups:
+            yield [items[j] for j in g]
+        return
     for i in range(0, len(idx), size):
         yield [items[j] for j in idx[i : i + size]]
 
@@ -262,7 +281,18 @@ def main() -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     torch.manual_seed(args.seed)
-    device = torch.device("cuda")
+    # One process per GPU under torchrun; each takes a slice of every batch.
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    ddp = world > 1
+    if ddp:
+        torch.distributed.init_process_group("nccl")
+        local = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local)
+        device = torch.device("cuda", local)
+    else:
+        device = torch.device("cuda")
+    main_rank = rank == 0
     tok = AutoTokenizer.from_pretrained(args.base)
     a = args.adapter
     if a == ROUTER:
@@ -367,11 +397,19 @@ def main() -> None:
                 **extra,
             )
             model = get_peft_model(model, cfg)
-    model.print_trainable_parameters()
+    raw = model  # the PEFT model; ``model`` is DDP-wrapped when distributed
+    if ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[device.index]
+        )
+    if main_rank:
+        raw.print_trainable_parameters()
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
     def evaluate(items: list) -> tuple[dict, list[list[float]]]:
-        model.eval()
+        # On the unwrapped model (rank 0 only): DDP's forward would wait for
+        # the other ranks.
+        raw.eval()
         probs: list[list[float]] = []
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             for b in batches(items, args.micro, False, 0):
@@ -379,9 +417,9 @@ def main() -> None:
                     [prompt(r) for r in b], [target(r) for r in b], pad_id, device
                 )
                 probs += torch.softmax(
-                    last_logits(model, ids, m, p, allowed), -1
+                    last_logits(raw, ids, m, p, allowed), -1
                 ).tolist()
-        model.train()
+        raw.train()
         tg = [target(r) for r in items]
         gold = [max(range(len(classes)), key=t.__getitem__) for t in tg]
         pred = [max(range(len(classes)), key=q.__getitem__) for q in probs]
@@ -440,26 +478,42 @@ def main() -> None:
     step, t0, run_loss, history = 0, time.time(), 0.0, []
     train_curve: list[dict] = []  # training loss, every 50 steps
     best = {"soft_ce": math.inf, "step": None}
+    lengths = [
+        (r[0].length(r[1]) if r[0] is not None else 0) + len(r[2]) // 3
+        for r in train_rows
+    ]
     model.train()
     epoch = 0
     while step < total:
-        for b in batches(train_rows, args.batch, True, args.seed + epoch):
-            for k in range(0, len(b), args.micro):
-                mb = b[k : k + args.micro]
+        for b in batches(train_rows, args.batch, True, args.seed + epoch, lengths):
+            share = b[rank::world]  # this rank's slice of the global batch
+            if len(b) < world:
+                continue  # a last short batch cannot feed every rank
+            micros = [
+                share[k : k + args.micro] for k in range(0, len(share), args.micro)
+            ]
+            for k, mb in enumerate(micros):
                 ids, m, p, tgt = collate(
                     [prompt(r) for r in mb], [target(r) for r in mb], pad_id, device
                 )
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                # Sync gradients once per step, on the last micro-batch.
+                sync = (
+                    model.no_sync()
+                    if ddp and k < len(micros) - 1
+                    else contextlib.nullcontext()
+                )
+                with sync, torch.autocast("cuda", dtype=torch.bfloat16):
                     logp = torch.log_softmax(last_logits(model, ids, m, p, allowed), -1)
-                    loss = -(tgt * logp).sum(-1).mean() * len(mb) / len(b)
-                loss.backward()
+                    # Mean over this rank's share; DDP averages the ranks.
+                    loss = -(tgt * logp).sum(-1).mean() * len(mb) / len(share)
+                    loss.backward()
                 run_loss += loss.item()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
             step += 1
-            if step % 50 == 0:
+            if step % 50 == 0 and main_rank:
                 print(
                     f"step {step}/{total} loss {run_loss / 50:.4f} "
                     f"lr {sched.get_last_lr()[0]:.2e} {time.time() - t0:.0f}s",
@@ -467,12 +521,12 @@ def main() -> None:
                 )
                 train_curve.append({"step": step, "loss": round(run_loss / 50, 5)})
                 run_loss = 0.0
-            if step % args.eval_every == 0 and val_rows:
+            if step % args.eval_every == 0 and val_rows and main_rank:
                 ev, _ = evaluate(val_rows[:1000])
                 history.append({"step": step, **{k: ev[k] for k in ("acc", "soft_ce")}})
                 if args.keep_best and ev["soft_ce"] < best["soft_ce"]:
                     best = {"soft_ce": ev["soft_ce"], "acc": ev["acc"], "step": step}
-                    model.save_pretrained(str(args.out / "best"))
+                    raw.save_pretrained(str(args.out / "best"))
                 print(
                     f"  held-out acc {ev['acc']:.4f} soft CE {ev['soft_ce']:.4f} "
                     f"(majority {ev['majority_baseline']:.4f})",
@@ -482,8 +536,13 @@ def main() -> None:
                 break
         epoch += 1
 
+    if ddp:
+        torch.distributed.barrier()
+    if not main_rank:
+        torch.distributed.destroy_process_group()
+        return
     args.out.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(args.out))
+    raw.save_pretrained(str(args.out))
     if args.kind == "sr":
         # What the Granite Switch composer reads to place an SR control token:
         # it replaces this single token, the last one of the prompt.
@@ -532,6 +591,8 @@ def main() -> None:
         )
         + f"; saved -> {args.out}"
     )
+    if ddp:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

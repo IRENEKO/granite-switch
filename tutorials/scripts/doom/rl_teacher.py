@@ -132,10 +132,17 @@ class Config:
     rollout: int = 128  # steps per env per update
     total_steps: int = 500_000_000
     episode_s: float = 180.0
+    # If episode_s_max > 0, each episode's length is drawn from [min, max] s.
+    episode_s_min: float = 0.0
+    episode_s_max: float = 0.0
     # Labels come from the rendered frame; 160x120 sees the same objects as
     # 640x480 (327 vs 332 enemy sightings on one seed) and steps 2.6x faster.
     resolution: str = "160X120"
-    bots: str = "default"  # a BOT_SETS name, or "mix" (easy/default/hard per episode)
+    # A BOT_SETS name; "mix" (easy/default/default/hard per episode) or "all"
+    # (every tier, uniform). n_bots is drawn per episode from [min, max].
+    bots: str = "default"
+    n_bots_min: int = 7
+    n_bots_max: int = 7
     style_switch_s: float = 40.0  # mean seconds between mid-episode style switches
     lr: float = 3e-4
     gamma: float = 0.998  # frameskip 1: 0.998^35 = 0.93 per second
@@ -148,7 +155,11 @@ class Config:
     max_grad_norm: float = 0.5
     ks_coef: float = 1.0  # kickstarting weight at step 0 ...
     ks_steps: int = 40_000_000  # ... decaying linearly to 0 by here
-    hidden: int = 256
+    # Kickstart from this rl_teacher checkpoint's distributions (soft labels)
+    # instead of the scripted player's actions.
+    ks_teacher: str = ""
+    hidden: int = 256  # GRU state
+    width: int = 256  # MLP encoder and critic
     eval_every: int = 50  # updates
     eval_matches: int = 8
     eval_workers: int = 8
@@ -163,10 +174,34 @@ def obs_vector(obs: Observation, style: str) -> np.ndarray:
     return np.concatenate([features(obs), extra])
 
 
+class _KSTeacher:
+    """A trained teacher on CPU inside an env worker (one GRU state per env),
+    giving kickstarting targets: its move and weapon distributions."""
+
+    def __init__(self, ckpt: str):
+        torch, _ = _torch()
+        torch.set_num_threads(1)
+        self.torch = torch
+        self.agent, _, _ = load(ckpt, "cpu")
+
+    def initial(self):
+        return self.agent.initial_state(1)
+
+    def step(self, h, obs: Observation, style: str, first: bool):
+        torch = self.torch
+        with torch.no_grad():
+            x = torch.as_tensor(obs_vector(obs, style)).view(1, 1, -1)
+            s = torch.tensor([[1.0 if first else 0.0]])
+            z, h = self.agent.sequence(x, s, h)
+            pm = torch.softmax(self.agent.pi_move(z[0]), -1)[0].numpy()
+            pw = torch.softmax(self.agent.pi_weapon(z[0]), -1)[0].numpy()
+        return pm, pw, h
+
+
 class _Slot:
     """One env inside a worker, with its episode bookkeeping."""
 
-    def __init__(self, cfg: Config, seed: int):
+    def __init__(self, cfg: Config, seed: int, ks: _KSTeacher | None = None):
         self.cfg, self.rng = cfg, random.Random(seed)
         self.seed = seed
         self.env = DoomEnv(
@@ -176,20 +211,33 @@ class _Slot:
         )
         self.episode = 0
         self.expert = Expert()
+        self.ks = ks
         self.new_episode()
 
-    def _bots(self) -> str:
+    def _bots(self) -> tuple[str, ...]:
         if self.cfg.bots == "mix":
-            return self.rng.choice(("easy", "default", "default", "hard"))
-        return self.cfg.bots
+            tier = self.rng.choice(("easy", "default", "default", "hard"))
+        elif self.cfg.bots == "all":
+            tier = self.rng.choice(tuple(BOT_SETS))
+        else:
+            tier = self.cfg.bots
+        n = self.rng.randint(self.cfg.n_bots_min, self.cfg.n_bots_max)
+        self.tier = tier
+        return BOT_SETS[tier][:n]
 
     def new_episode(self) -> None:
         self.episode += 1
         self.bots = self._bots()
+        if self.cfg.episode_s_max > 0:
+            secs = self.rng.uniform(self.cfg.episode_s_min, self.cfg.episode_s_max)
+            self.env.game.set_episode_timeout(int(secs * TIC_HZ))
         self.obs = self.env.reset(seed=self.seed * 1000 + self.episode, bots=self.bots)
         self.style = self.rng.choice(STYLES)
         self.ret = 0.0
         self.expert.reset()
+        self.ks_h, self.ks_first = (
+            (self.ks.initial(), True) if self.ks else (None, True)
+        )
         self._skip_dead()
 
     def _skip_dead(self) -> float:
@@ -217,7 +265,7 @@ class _Slot:
         if self.obs.done:
             info = {
                 "style": self.style,
-                "bots": self.bots,
+                "bots": f"{self.tier}x{len(self.bots)}",
                 "return": round(self.ret, 3),
                 **{
                     k: v
@@ -233,13 +281,28 @@ class _Slot:
             self.style = self.rng.choice(STYLES)
         return r, False, info
 
-    def views(self) -> tuple[np.ndarray, np.ndarray, int, int]:
-        """Actor input, critic extra input, and the scripted player's move and
-        weapon-head labels for kickstarting."""
+    def views(
+        self, labels: bool = True
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Actor input, critic extra input, and the kickstarting targets: move
+        and weapon-head distributions (one-hot for the scripted player, the
+        kickstart teacher's softmax otherwise). Called once per decision.
+        ``labels=False`` (kickstarting over) skips computing the targets."""
         frac = self.obs.tick / max(1, self.env.game.get_episode_timeout())
-        move = _ACTION_INDEX[self.expert.act(self.obs, self.style)]
-        slot = self.expert.weapon(self.obs, self.style)
-        weapon = KEEP if slot == self.obs.slot else WEAPON_SLOTS.index(slot)
+        if not labels:
+            move = np.zeros(N_MOVE, np.float32)
+            weapon = np.zeros(N_WEAPON, np.float32)
+        elif self.ks is not None:
+            move, weapon, self.ks_h = self.ks.step(
+                self.ks_h, self.obs, self.style, self.ks_first
+            )
+            self.ks_first = False
+        else:
+            move = np.zeros(N_MOVE, np.float32)
+            move[_ACTION_INDEX[self.expert.act(self.obs, self.style)]] = 1.0
+            slot = self.expert.weapon(self.obs, self.style)
+            weapon = np.zeros(N_WEAPON, np.float32)
+            weapon[KEEP if slot == self.obs.slot else WEAPON_SLOTS.index(slot)] = 1.0
         return (
             obs_vector(self.obs, self.style),
             priv_features(self.obs, frac),
@@ -250,15 +313,19 @@ class _Slot:
 
 def _env_worker(conn, cfg: Config, seeds: list[int]) -> None:
     isolate_workdir()
-    slots = [_Slot(cfg, s) for s in seeds]
+    ks = _KSTeacher(cfg.ks_teacher) if cfg.ks_teacher else None
+    slots = [_Slot(cfg, s, ks) for s in seeds]
+    rounds = 0  # lockstep rounds; global steps = rounds * cfg.envs
 
     def gather():
-        v = [s.views() for s in slots]
+        # Kickstarting targets only while their weight is non-zero.
+        labels = rounds * cfg.envs < cfg.ks_steps
+        v = [s.views(labels) for s in slots]
         return (
             np.stack([x[0] for x in v]),
             np.stack([x[1] for x in v]),
-            np.asarray([x[2] for x in v]),
-            np.asarray([x[3] for x in v]),
+            np.stack([x[2] for x in v]).astype(np.float32),
+            np.stack([x[3] for x in v]).astype(np.float32),
         )
 
     conn.send(gather())
@@ -275,6 +342,7 @@ def _env_worker(conn, cfg: Config, seeds: list[int]) -> None:
             dones.append(d)
             if info:
                 infos.append(info)
+        rounds += 1
         views = gather()
         busy = time.perf_counter() - t0
         conn.send(
@@ -338,20 +406,23 @@ def _torch():
     return torch, nn
 
 
-def build_agent(hidden: int = 256):
+def build_agent(hidden: int = 256, width: int = 256):
     torch, nn = _torch()
 
     class Agent(nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.enc = nn.Sequential(
-                nn.Linear(OBS_DIM, 256), nn.ReLU(), nn.Linear(256, 256), nn.ReLU()
+                nn.Linear(OBS_DIM, width),
+                nn.ReLU(),
+                nn.Linear(width, width),
+                nn.ReLU(),
             )
-            self.gru = nn.GRU(256, hidden)
+            self.gru = nn.GRU(width, hidden)
             self.pi_move = nn.Linear(hidden, N_MOVE)
             self.pi_weapon = nn.Linear(hidden, N_WEAPON)
             self.v = nn.Sequential(
-                nn.Linear(hidden + PRIV_DIM, 256), nn.ReLU(), nn.Linear(256, 1)
+                nn.Linear(hidden + PRIV_DIM, width), nn.ReLU(), nn.Linear(width, 1)
             )
             for m in (self.pi_move, self.pi_weapon):
                 nn.init.orthogonal_(m.weight, 0.01)
@@ -403,7 +474,7 @@ def load(path: str | Path, device: str = "cpu"):
     torch, _ = _torch()
     ck = torch.load(str(path), map_location=device, weights_only=False)
     cfg = Config(**ck["config"])
-    agent = build_agent(cfg.hidden).to(device)
+    agent = build_agent(cfg.hidden, cfg.width).to(device)
     agent.load_state_dict(ck["state_dict"])
     agent.eval()
     return agent, cfg, ck
@@ -497,7 +568,7 @@ def train(cfg: Config, out: Path, device: str, resume: Path | None) -> None:
         torch.set_num_threads(4)  # leave the cores to the env workers
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(asdict(cfg), indent=1))
-    agent = build_agent(cfg.hidden).to(device)
+    agent = build_agent(cfg.hidden, cfg.width).to(device)
     opt = torch.optim.Adam(agent.parameters(), lr=cfg.lr, eps=1e-5)
     update, steps = 0, 0
     if resume is not None:
@@ -525,8 +596,8 @@ def train(cfg: Config, out: Path, device: str, resume: Path | None) -> None:
     priv_b = torch.zeros(T, B, PRIV_DIM, device=device)
     move_b = torch.zeros(T, B, dtype=torch.long, device=device)
     weap_b = torch.zeros(T, B, dtype=torch.long, device=device)
-    exm_b = torch.zeros(T, B, dtype=torch.long, device=device)
-    exw_b = torch.zeros(T, B, dtype=torch.long, device=device)
+    exm_b = torch.zeros(T, B, N_MOVE, device=device)  # kickstart targets
+    exw_b = torch.zeros(T, B, N_WEAPON, device=device)
     logp_b = torch.zeros(T, B, device=device)
     plan_b = torch.zeros(T, B, device=device)
     rew_b = torch.zeros(T, B, device=device)
@@ -622,13 +693,10 @@ def train(cfg: Config, out: Path, device: str, resume: Path | None) -> None:
                 vf = 0.5 * ((v - ret[:, ix]) ** 2).mean()
                 ent_m = dm.entropy().mean()
                 ent_w = (pl * dw.entropy()).sum() / pl.sum().clamp(min=1)
-                ce_m = torch.nn.functional.cross_entropy(
-                    lm.reshape(-1, N_MOVE), exm_b[:, ix].reshape(-1)
-                )
-                ce_w_all = torch.nn.functional.cross_entropy(
-                    lw.reshape(-1, N_WEAPON), exw_b[:, ix].reshape(-1), reduction="none"
-                )
-                ce_w = (pl.reshape(-1) * ce_w_all).sum() / pl.sum().clamp(min=1)
+                # Cross-entropy to the kickstart targets (distributions).
+                ce_m = -(exm_b[:, ix] * torch.log_softmax(lm, -1)).sum(-1).mean()
+                ce_w_all = -(exw_b[:, ix] * torch.log_softmax(lw, -1)).sum(-1)
+                ce_w = (pl * ce_w_all).sum() / pl.sum().clamp(min=1)
                 loss = pg + cfg.vf_coef * vf - cfg.ent_coef * (ent_m + 0.5 * ent_w)
                 if ks > 0:
                     loss = loss + ks * (ce_m + ce_w)
@@ -648,7 +716,7 @@ def train(cfg: Config, out: Path, device: str, resume: Path | None) -> None:
                 stats["ent_w"] += ent_w.item()
                 stats["ks_ce"] += ce_m.item()
                 stats["expert_agree"] += float(
-                    (lm.argmax(-1) == exm_b[:, ix]).float().mean()
+                    (lm.argmax(-1) == exm_b[:, ix].argmax(-1)).float().mean()
                 )
                 n_mb += 1
         update += 1
@@ -785,8 +853,10 @@ def main() -> None:
             if getattr(args, k, None) is not None
         }
         cfg = replace(cfg, **overrides)
-        if cfg.bots != "mix" and cfg.bots not in BOT_SETS:
-            raise SystemExit(f"--bots must be mix or one of {sorted(BOT_SETS)}")
+        if cfg.ks_teacher:  # workers run in their own directories
+            cfg = replace(cfg, ks_teacher=str(Path(cfg.ks_teacher).resolve()))
+        if cfg.bots not in ("mix", "all") and cfg.bots not in BOT_SETS:
+            raise SystemExit(f"--bots must be mix, all or one of {sorted(BOT_SETS)}")
         train(cfg, args.out, args.device, args.resume)
         return
 
