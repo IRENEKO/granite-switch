@@ -380,7 +380,11 @@ def main() -> None:
         if args.init is not None:
             from peft import PeftModel
 
-            model = PeftModel.from_pretrained(model, str(args.init), is_trainable=True)
+            # Onto this rank's GPU: the default ("cuda") is device 0, which
+            # the other ranks cannot open in exclusive-process mode.
+            model = PeftModel.from_pretrained(
+                model, str(args.init), is_trainable=True, torch_device=str(device)
+            )
         else:
             extra = (
                 {"alora_invocation_tokens": alora_invocation_ids(tok)}

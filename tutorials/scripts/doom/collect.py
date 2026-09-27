@@ -63,6 +63,7 @@ from doom_env import (
     ACTIONS,
     BOT_SETS,
     MATCH_TICS,
+    RESPAWN_S,
     TIC_HZ,
     WEAPON_SLOTS,
     DoomEnv,
@@ -152,6 +153,8 @@ def _make_env(task: dict) -> DoomEnv:
         timeout_tics=task["timeout"],
         bots=task["bots"],
         n_bots=task["n_bots"],
+        respawn_s=task.get("respawn_s", RESPAWN_S),
+        item_rules=task.get("item_rules", "standard"),
     )
 
 
@@ -484,6 +487,12 @@ def main() -> None:
     ap.add_argument(
         "--row-every", type=int, default=1, help="Keep every k-th tic's row"
     )
+    ap.add_argument(
+        "--respawn-s", type=int, default=RESPAWN_S, help="Seconds dead per death"
+    )
+    ap.add_argument(
+        "--item-rules", default="standard", choices=["standard", "classic", "scarce"]
+    )
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument(
         "--timeout-s", type=float, default=MATCH_TICS / TIC_HZ, help="Match length"
@@ -538,6 +547,8 @@ def main() -> None:
                     "bots": tier,
                     "n_bots": n_bots,
                     "row_every": args.row_every,
+                    "respawn_s": args.respawn_s,
+                    "item_rules": args.item_rules,
                     "teacher": teacher,
                     "dart": args.dart,
                     "beta": args.beta,

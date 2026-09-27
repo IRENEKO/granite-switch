@@ -75,8 +75,23 @@ PLAYER_NAME = "AI"
 _GAME_ARGS = (
     "-host 1 -deathmatch +sv_forcerespawn 1 +sv_respawnprotect 1 "
     "+sv_spawnfarthest 1 +sv_nocrouch 1 +sv_nojump 1 +sv_nofreelook 1 "
-    f"+viz_respawn_delay 1 +name {PLAYER_NAME} +colorset 0"
+    f"+name {PLAYER_NAME} +colorset 0"
 )
+# The ViZDoom competition's respawn delay (cig_multiplayer_bots.py): a death
+# costs 10 s of the match. Results before 2026-09-27 used 1 s.
+RESPAWN_S = 10
+# Item rules, set on the server console after each reset (ZDoom reapplies its
+# deathmatch defaults at game start, so command-line cvars do not stick):
+#   standard: ZDoom's deathmatch defaults, items respawn after 30 s and weapons
+#             stay on the floor, so ammo is effectively unlimited
+#   classic:  Doom's original "altdeath": items respawn, weapons do not stay
+#   scarce:   nothing respawns and weapons do not stay; after the map's supply
+#             only kills' drops and the respawn pistol are left
+ITEM_RULES = {
+    "standard": {"sv_itemrespawn": "true", "sv_weaponstay": "true"},
+    "classic": {"sv_itemrespawn": "true", "sv_weaponstay": "false"},
+    "scarce": {"sv_itemrespawn": "false", "sv_weaponstay": "false"},
+}
 
 # ── Action space ───────────────────────────────────────────────────────────────
 # Each name is one token in the Granite 4.1 tokenizer, with no leading space
@@ -519,6 +534,8 @@ class DoomEnv:
             :data:`BOTS_CFG`.
         n_bots: How many of them join (the first ``n_bots``).
         timeout_tics: Match length; :data:`MATCH_TICS` is 10 minutes.
+        respawn_s: Seconds a death keeps the player out (:data:`RESPAWN_S`).
+        item_rules: A key of :data:`ITEM_RULES`.
     """
 
     def __init__(
@@ -530,12 +547,17 @@ class DoomEnv:
         timeout_tics: int = MATCH_TICS,
         bots: str | tuple[str, ...] = "default",
         n_bots: int = 7,
+        respawn_s: int = RESPAWN_S,
+        item_rules: str = "standard",
     ):
+        if item_rules not in ITEM_RULES:
+            raise ValueError(f"item_rules must be one of {sorted(ITEM_RULES)}")
         g = vzd.DoomGame()
         g.load_config(os.path.join(vzd.scenarios_path, "cig.cfg"))
         g.set_doom_map("map02")
         g.set_mode(vzd.Mode.PLAYER)  # after load_config: cig.cfg sets ASYNC_PLAYER
         g.add_game_args(_GAME_ARGS)
+        g.add_game_args(f"+viz_respawn_delay {int(respawn_s)}")
         g.add_game_args(f"+viz_bots_path {BOTS_CFG}")
         g.set_available_buttons(_BUTTONS)
         g.set_available_game_variables(_VARS)
@@ -556,6 +578,7 @@ class DoomEnv:
         self.game = g
         self.bots = bots
         self.n_bots = n_bots
+        self.item_rules = item_rules
         self._frame: np.ndarray | None = None
         self._segments: np.ndarray | None = None
         self._origin: tuple[float, float] | None = None
@@ -579,6 +602,8 @@ class DoomEnv:
             self.bots = bots
         g = self.game
         g.new_episode()
+        for cvar, value in ITEM_RULES[self.item_rules].items():
+            g.send_game_command(f"{cvar} {value}")
         g.send_game_command("removebots")
         names = self.bot_names()
         for name in names:
@@ -592,7 +617,7 @@ class DoomEnv:
         # A joining bot can spawn on top of the player (a telefrag). That is not
         # part of the match: wait out the respawn, then zero every counter here,
         # since ViZDoom also carries our counters over from the last episode.
-        for _ in range(10 * TIC_HZ):
+        for _ in range(30 * TIC_HZ):
             if not g.is_player_dead():
                 break
             g.make_action(_DEAD_BUTTONS, 1)

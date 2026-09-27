@@ -58,6 +58,7 @@ from doom_env import (
     FEATURE_DIM,
     MATCH_TICS,
     PRIV_DIM,
+    RESPAWN_S,
     TIC_HZ,
     WEAPON_SLOTS,
     DoomEnv,
@@ -138,6 +139,8 @@ class Config:
     # Labels come from the rendered frame; 160x120 sees the same objects as
     # 640x480 (327 vs 332 enemy sightings on one seed) and steps 2.6x faster.
     resolution: str = "160X120"
+    respawn_s: int = RESPAWN_S  # seconds dead after a death (competition: 10)
+    item_rules: str = "standard"  # doom_env.ITEM_RULES: standard, classic, scarce
     # A BOT_SETS name; "mix" (easy/default/default/hard per episode) or "all"
     # (every tier, uniform). n_bots is drawn per episode from [min, max].
     bots: str = "default"
@@ -158,6 +161,8 @@ class Config:
     # Kickstart from this rl_teacher checkpoint's distributions (soft labels)
     # instead of the scripted player's actions.
     ks_teacher: str = ""
+    # Start from this checkpoint's weights (fresh optimizer and schedule).
+    init: str = ""
     hidden: int = 256  # GRU state
     width: int = 256  # MLP encoder and critic
     eval_every: int = 50  # updates
@@ -208,6 +213,8 @@ class _Slot:
             seed=seed,
             resolution=cfg.resolution,
             timeout_tics=int(cfg.episode_s * TIC_HZ),
+            respawn_s=cfg.respawn_s,
+            item_rules=cfg.item_rules,
         )
         self.episode = 0
         self.expert = Expert()
@@ -240,26 +247,32 @@ class _Slot:
         )
         self._skip_dead()
 
-    def _skip_dead(self) -> float:
-        """Dead tics need no decision: step through them, keeping their reward."""
-        r = 0.0
+    def _skip_dead(self) -> tuple[float, int]:
+        """Dead tics need no decision: step through them, keeping their reward.
+        Returns (reward, tics skipped)."""
+        r, n = 0.0, 0
         while self.obs.dead and not self.obs.done:
             prev = self.obs
             self.obs = self.env.step("wait")
+            n += 1
             if not self.obs.done:
                 r += shaped_reward(prev, self.obs, STYLE_SHAPING[self.style])
-        return r
+        return r, n
 
-    def step(self, move: int, weapon: int) -> tuple[float, bool, dict | None]:
+    def step(self, move: int, weapon: int) -> tuple[float, bool, dict | None, int]:
+        """One decision. Returns (reward, done, episode info, tics elapsed):
+        1, plus the tics spent dead if this action got the player killed."""
         prev = self.obs
         slot = None
         if prev.tick % PLAN_EVERY_TICS == 0:
             slot = prev.slot if weapon == KEEP else WEAPON_SLOTS[weapon]
         self.obs = self.env.step(ACTIONS[move], weapon=slot)
-        r = 0.0
+        r, elapsed = 0.0, 1
         if not self.obs.done:
             r = shaped_reward(prev, self.obs, STYLE_SHAPING[self.style])
-            r += self._skip_dead()
+            dr, dead = self._skip_dead()
+            r += dr
+            elapsed += dead
         self.ret += r
         info = None
         if self.obs.done:
@@ -274,12 +287,12 @@ class _Slot:
                 },
             }
             self.new_episode()
-            return r, True, info
+            return r, True, info, elapsed
         # Occasional mid-episode style switches, as the live demo does.
         switch_p = 1.0 / max(1.0, self.cfg.style_switch_s * TIC_HZ)
         if self.rng.random() < switch_p:
             self.style = self.rng.choice(STYLES)
-        return r, False, info
+        return r, False, info, elapsed
 
     def views(
         self, labels: bool = True
@@ -335,18 +348,26 @@ def _env_worker(conn, cfg: Config, seeds: list[int]) -> None:
             break
         moves, weapons = msg
         t0 = time.perf_counter()
-        rews, dones, infos = [], [], []
+        rews, dones, infos, elapsed = [], [], [], []
         for s, m, w in zip(slots, moves, weapons):
-            r, d, info = s.step(int(m), int(w))
+            r, d, info, el = s.step(int(m), int(w))
             rews.append(r)
             dones.append(d)
+            elapsed.append(el)
             if info:
                 infos.append(info)
         rounds += 1
         views = gather()
         busy = time.perf_counter() - t0
         conn.send(
-            (*views, np.asarray(rews, np.float32), np.asarray(dones), infos, busy)
+            (
+                *views,
+                np.asarray(rews, np.float32),
+                np.asarray(dones),
+                infos,
+                busy,
+                np.asarray(elapsed, np.float32),
+            )
         )
     for s in slots:
         s.env.close()
@@ -389,6 +410,7 @@ class VecEnv:
         parts = [c.recv() for c in self.conns]
         arrays = tuple(np.concatenate([p[k] for p in parts]) for k in range(6))
         self.busy = [p[7] for p in parts]  # seconds each worker spent stepping
+        self.elapsed = np.concatenate([p[8] for p in parts])  # tics per step
         return (*arrays, [x for p in parts for x in p[6]])
 
     def close(self) -> None:
@@ -523,11 +545,18 @@ class RLPolicy:
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 def play_match(args: tuple) -> dict:
     """One full match with a checkpoint on CPU; the collect.py stats row."""
-    ckpt, seed, style, bots, seconds, sample = args
+    ckpt, seed, style, bots, seconds, sample, n_bots, respawn_s, item_rules = args
     isolate_workdir()
     pol = RLPolicy(ckpt)
     rng = random.Random(seed)
-    env = DoomEnv(seed=seed, timeout_tics=int(seconds * TIC_HZ), bots=bots)
+    env = DoomEnv(
+        seed=seed,
+        timeout_tics=int(seconds * TIC_HZ),
+        bots=bots,
+        n_bots=n_bots,
+        respawn_s=respawn_s,
+        item_rules=item_rules,
+    )
     obs = env.reset(seed=seed)
     while not obs.done:
         if obs.dead:
@@ -551,10 +580,19 @@ def play_match(args: tuple) -> dict:
 
 
 def eval_tasks(
-    ckpt, matches: int, styles, bots: str, seconds: float, seed: int, sample=True
+    ckpt,
+    matches: int,
+    styles,
+    bots: str,
+    seconds: float,
+    seed: int,
+    sample=True,
+    n_bots: int = 7,
+    respawn_s: int = RESPAWN_S,
+    item_rules: str = "standard",
 ):
     return [
-        (str(ckpt), seed + i, st, bots, seconds, sample)
+        (str(ckpt), seed + i, st, bots, seconds, sample, n_bots, respawn_s, item_rules)
         for st in styles
         for i in range(matches)
     ]
@@ -577,6 +615,9 @@ def train(cfg: Config, out: Path, device: str, resume: Path | None) -> None:
         update, steps = ck.get("update", 0), ck.get("steps", 0)
         if "opt" in ck:
             opt.load_state_dict(ck["opt"])
+    elif cfg.init:  # weights only: a fine-tune with its own optimizer and schedule
+        ck = torch.load(cfg.init, map_location=device, weights_only=False)
+        agent.load_state_dict(ck["state_dict"])
     log = open(out / "train.jsonl", "a")
     evlog = open(out / "eval.jsonl", "a")
     eval_pool = mp.get_context("spawn").Pool(cfg.eval_workers)
@@ -601,6 +642,7 @@ def train(cfg: Config, out: Path, device: str, resume: Path | None) -> None:
     logp_b = torch.zeros(T, B, device=device)
     plan_b = torch.zeros(T, B, device=device)
     rew_b = torch.zeros(T, B, device=device)
+    tics_b = torch.ones(T, B, device=device)  # game tics each step took
     start_b = torch.zeros(T, B, device=device)
     val_b = torch.zeros(T, B, device=device)
     episodes: list[dict] = []
@@ -641,12 +683,16 @@ def train(cfg: Config, out: Path, device: str, resume: Path | None) -> None:
             next_exm = torch.as_tensor(em, device=device)
             next_exw = torch.as_tensor(ew, device=device)
             rew_b[t] = torch.as_tensor(r, device=device)
+            tics_b[t] = torch.as_tensor(venv.elapsed, device=device)
             next_start = torch.as_tensor(d.astype(np.float32), device=device)
         steps += B * T
         t_roll = time.time() - t_roll
 
-        # GAE. start_b[t+1] marks that step t ended its episode.
+        # GAE. start_b[t+1] marks that step t ended its episode. A step that got
+        # the player killed lasts 1 + the respawn delay in tics, so it is
+        # discounted by gamma**tics: time spent dead is time lost.
         with torch.no_grad():
+            disc = cfg.gamma**tics_b
             z, _ = agent.sequence(next_obs[None], next_start[None], h.clone())
             _, _, next_v = agent.heads(z[0], next_priv)
             adv = torch.zeros_like(rew_b)
@@ -654,8 +700,8 @@ def train(cfg: Config, out: Path, device: str, resume: Path | None) -> None:
             for t in reversed(range(T)):
                 nonterm = 1.0 - (next_start if t == T - 1 else start_b[t + 1])
                 nv = next_v if t == T - 1 else val_b[t + 1]
-                delta = rew_b[t] + cfg.gamma * nv * nonterm - val_b[t]
-                last = delta + cfg.gamma * cfg.gae_lambda * nonterm * last
+                delta = rew_b[t] + disc[t] * nv * nonterm - val_b[t]
+                last = delta + disc[t] * cfg.gae_lambda * nonterm * last
                 adv[t] = last
             ret = adv + val_b
 
@@ -768,7 +814,14 @@ def train(cfg: Config, out: Path, device: str, resume: Path | None) -> None:
                 {"update": update, "steps": steps, "opt": opt.state_dict()},
             )
             tasks = eval_tasks(
-                ck, cfg.eval_matches, ("fighter",), "default", cfg.eval_seconds, 777
+                ck,
+                cfg.eval_matches,
+                ("fighter",),
+                "default",
+                cfg.eval_seconds,
+                777,
+                respawn_s=cfg.respawn_s,
+                item_rules=cfg.item_rules,
             )
             pending_evals.append((update, eval_pool.map_async(play_match, tasks)))
         for u, res in list(pending_evals):
@@ -820,6 +873,11 @@ def main() -> None:
     e.add_argument("--matches", type=int, default=12)
     e.add_argument("--styles", nargs="+", default=["fighter"], choices=STYLES)
     e.add_argument("--bots", default="default", choices=sorted(BOT_SETS))
+    e.add_argument("--n-bots", type=int, default=7)
+    e.add_argument("--respawn-s", type=int, default=RESPAWN_S)
+    e.add_argument(
+        "--item-rules", default="standard", choices=["standard", "classic", "scarce"]
+    )
     e.add_argument("--seconds", type=float, default=MATCH_TICS / TIC_HZ)
     e.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     e.add_argument("--seed", type=int, default=5000)
@@ -855,6 +913,8 @@ def main() -> None:
         cfg = replace(cfg, **overrides)
         if cfg.ks_teacher:  # workers run in their own directories
             cfg = replace(cfg, ks_teacher=str(Path(cfg.ks_teacher).resolve()))
+        if cfg.init:
+            cfg = replace(cfg, init=str(Path(cfg.init).resolve()))
         if cfg.bots not in ("mix", "all") and cfg.bots not in BOT_SETS:
             raise SystemExit(f"--bots must be mix, all or one of {sorted(BOT_SETS)}")
         train(cfg, args.out, args.device, args.resume)
@@ -871,6 +931,9 @@ def main() -> None:
         args.seconds,
         args.seed,
         sample=not args.argmax,
+        n_bots=args.n_bots,
+        respawn_s=args.respawn_s,
+        item_rules=args.item_rules,
     )
     with mp.get_context("spawn").Pool(args.workers) as pool:
         rows = []
