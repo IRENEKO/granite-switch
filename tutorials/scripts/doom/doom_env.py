@@ -77,9 +77,10 @@ _GAME_ARGS = (
     "+sv_spawnfarthest 1 +sv_nocrouch 1 +sv_nojump 1 +sv_nofreelook 1 "
     f"+name {PLAYER_NAME} +colorset 0"
 )
-# The ViZDoom competition's respawn delay (cig_multiplayer_bots.py): a death
-# costs 10 s of the match. Results before 2026-09-27 used 1 s.
-RESPAWN_S = 10
+# Seconds a death keeps the player out. The ViZDoom competition uses 10
+# (cig_multiplayer_bots.py); this demo uses 1, and every result here does
+# unless it says otherwise.
+RESPAWN_S = 1
 # Item rules, set on the server console after each reset (ZDoom reapplies its
 # deathmatch defaults at game start, so command-line cvars do not stick):
 #   standard: ZDoom's deathmatch defaults, items respawn after 30 s and weapons

@@ -218,8 +218,11 @@ def main() -> None:
     c.add_argument(
         "--router-runs", type=Path, help="Where the router adapter lives if elsewhere"
     )
+    s.add_argument("--kind", choices=KINDS, default="alora")
+    # The composer reads Shadow Residual from the weights (a cross_stream LoRA),
+    # not from the staging directory, so SR adapters are staged under lora/.
+    c.add_argument("--kind", choices=(*KINDS, "sr"), default="alora")
     for p in (s, c):
-        p.add_argument("--kind", choices=KINDS, default="alora")
         p.add_argument("--base", default="ibm-granite/granite-4.1-3b")
         p.add_argument(
             "--out", type=Path, required=True, help="Composed checkpoint dir"
@@ -260,9 +263,8 @@ def main() -> None:
             adapters[name] = root / name
             if not (adapters[name] / "adapter_config.json").exists():
                 raise SystemExit(f"missing trained adapter: {adapters[name]}")
-    paths = [
-        stage(d, n, stage_root, target_model, args.kind) for n, d in adapters.items()
-    ]
+    kind = "lora" if args.kind == "sr" else args.kind
+    paths = [stage(d, n, stage_root, target_model, kind) for n, d in adapters.items()]
     compose(paths, args.base, args.out)
     print(f"\ncomposed {len(paths)} adapters ({', '.join(adapters)}) -> {args.out}")
 

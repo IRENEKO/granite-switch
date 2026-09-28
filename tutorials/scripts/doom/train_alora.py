@@ -204,6 +204,13 @@ def last_logits(model, input_ids, mask, pos, allowed):
     return out.logits[:, -1, :][:, allowed].float()
 
 
+def train_window(curve: list[dict], steps: int) -> str:
+    """Mean training loss over the last ``steps`` steps (one pass: each batch is
+    fresh, so this is the training distribution's own held-out loss)."""
+    last = [c["loss"] for c in curve[-max(1, steps // 50) :]]
+    return f", train loss {sum(last) / len(last):.4f}" if last else ""
+
+
 def auc(scores: list[float], positives: list[bool]) -> float | None:
     """Rank AUC (probability a random positive outscores a random negative)."""
     pos = [s for s, y in zip(scores, positives) if y]
@@ -266,6 +273,9 @@ def main() -> None:
     ap.add_argument("--max-heldout", type=int, default=4000)
     ap.add_argument("--val-frac", type=float, default=0.08)
     ap.add_argument("--eval-every", type=int, default=500)
+    ap.add_argument(
+        "--eval-n", type=int, default=1000, help="Held-out rows per mid-run evaluation"
+    )
     ap.add_argument("--weight-decay", type=float, default=0.0)
     ap.add_argument(
         "--keep-best",
@@ -526,14 +536,15 @@ def main() -> None:
                 train_curve.append({"step": step, "loss": round(run_loss / 50, 5)})
                 run_loss = 0.0
             if step % args.eval_every == 0 and val_rows and main_rank:
-                ev, _ = evaluate(val_rows[:1000])
+                ev, _ = evaluate(val_rows[: args.eval_n])
                 history.append({"step": step, **{k: ev[k] for k in ("acc", "soft_ce")}})
                 if args.keep_best and ev["soft_ce"] < best["soft_ce"]:
                     best = {"soft_ce": ev["soft_ce"], "acc": ev["acc"], "step": step}
                     raw.save_pretrained(str(args.out / "best"))
                 print(
                     f"  held-out acc {ev['acc']:.4f} soft CE {ev['soft_ce']:.4f} "
-                    f"(majority {ev['majority_baseline']:.4f})",
+                    f"(majority {ev['majority_baseline']:.4f}) at step {step}"
+                    + train_window(train_curve, args.eval_every),
                     flush=True,
                 )
             if step >= total:

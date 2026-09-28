@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import math
 import os
 import re
@@ -255,6 +256,12 @@ def alora_invocation_ids(tokenizer) -> list[int]:
     return tokenizer.encode(f"{_SOR}assistant{_EOR}", add_special_tokens=False)
 
 
+def is_dual_stream(model_dir: str) -> bool:
+    """Whether a checkpoint is a Shadow Residual (dual-stream) composition."""
+    cfg = os.path.join(model_dir, "config.json")
+    return os.path.exists(cfg) and bool(json.load(open(cfg)).get("dual_stream"))
+
+
 def adapter_placement(tokenizer) -> str:
     """Where the composed chat template puts control tokens: ``alora`` (before
     the assistant header), ``lora`` (position 0), ``sr`` (last token), or
@@ -445,6 +452,12 @@ class VLLMPolicy:
             weapon planner (0 = greedy). Students of a stochastic RL teacher
             play better sampling, as the teacher does; the critic and router
             stay greedy.
+        attention: vLLM ``attention_config``. ``None`` picks FlashAttention 2
+            for a Shadow Residual checkpoint: its attention is one layer with
+            twice the model's query heads, and FlashAttention 3's
+            ahead-of-time schedule is sized from the model's head count, so
+            under vLLM 0.19.1 it raises in eager mode and returns wrong
+            outputs under CUDA graphs.
     """
 
     name = "vllm"
@@ -468,10 +481,13 @@ class VLLMPolicy:
         async_scheduling: bool | None = None,
         log_stats: bool = False,
         temperature: float = 0.0,
+        attention: dict | None = None,
     ):
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         from vllm import LLM, SamplingParams
 
+        if attention is None and is_dual_stream(model):
+            attention = {"flash_attn_version": 2}
         self.llm = LLM(
             model=model,
             dtype="bfloat16",
@@ -497,6 +513,7 @@ class VLLMPolicy:
                 if async_scheduling is None
                 else {"async_scheduling": async_scheduling}
             ),
+            **({} if attention is None else {"attention_config": attention}),
         )
         self.tok = self.llm.get_tokenizer()
         self.base_model = base_model
