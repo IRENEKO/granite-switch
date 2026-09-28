@@ -31,6 +31,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.models.granitemoehybrid import GraniteMoeSharedMLP
 
 from granite_switch.vllm.core.lora import SwitchedLoRALinear
 
@@ -124,12 +125,14 @@ class ShadowResidualAttention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # Rotary embeddings (the switch model is always RoPE).
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            max_position=config.max_position_embeddings,
-            rope_parameters=config.rope_parameters,
-        )
+        if getattr(config, "position_embedding_type", "rope") == "rope":
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                max_position=config.max_position_embeddings,
+                rope_parameters=config.rope_parameters,
+            )
+        else:
+            self.rotary_emb = None
 
         # Doubled query heads (base + adapter interleaved) against base-only K/V.
         self.attn = Attention(
@@ -183,7 +186,7 @@ class ShadowResidualDecoderLayer(nn.Module):
     half never receives a delta or shunt, so it stays base-equivalent.
 
     Covers all three MLP shapes Granite ships: a dense shared MLP alone (4.0/4.1),
-    a frozen expert bank alongside it (4.x MoE), and the expert bank alone
+    a frozen expert bank alongside it (4.x MoE hybrid), and the expert bank alone
     (granitemoe, ``shared_intermediate_size == 0``). With experts, the adapter
     stream always inherits the base stream's expert assignment. Only *routing* is
     ever shared — the shared MLP, where one exists, always runs per-stream with
@@ -208,12 +211,12 @@ class ShadowResidualDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
 
-        # Routed expert bank (4.x MoE, and the ONLY MLP path on a pure
+        # Routed expert bank (4.x MoE hybrid, and the ONLY MLP path on a pure
         # sparse base like granitemoe). Frozen: the experts are never LoRA
         # targets, so no SwitchedLoRALinear wrapping here.
         self.has_experts = getattr(config, "num_local_experts", 0) > 0
         if self.has_experts:
-            from vllm.model_executor.models.granitemoe import GraniteMoeMoE
+            from vllm.model_executor.models.granitemoehybrid import GraniteMoeMoE
 
             self.block_sparse_moe = GraniteMoeMoE(
                 num_experts=config.num_local_experts,
@@ -230,10 +233,6 @@ class ShadowResidualDecoderLayer(nn.Module):
         # that no checkpoint ships. Same gate as the plain-LoRA decoder.
         self.has_shared_mlp = getattr(config, "shared_intermediate_size", 0) > 0
         if self.has_shared_mlp:
-            from vllm.model_executor.models.granitemoeshared import (
-                GraniteMoeSharedMLP,
-            )
-
             # Fused shared MLP (gate|up with in-kernel SwiGLU, + down), each wrapped
             # in SwitchedLoRALinear. Runs over the [2M, H] stack; base half gets no
             # delta. Wrapped UNCONDITIONALLY (not gated on

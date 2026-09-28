@@ -50,7 +50,7 @@ class GraniteSwitchAttentionDecoderLayer(nn.Module):
 
     The MLP section is whichever of the two paths the base has: a frozen expert
     bank when ``num_local_experts > 0``, a dense ``shared_mlp`` when
-    ``shared_intermediate_size > 0``, or both (Granite 4 MoE + shared expert).
+    ``shared_intermediate_size > 0``, or both (Granite 4 hybrid).
 
     This is the layer for plain LoRA / aLoRA checkpoints.  Shadow Residual
     checkpoints use :class:`SRSwitchDecoderLayer`, which subclasses this one and
@@ -355,7 +355,10 @@ class GraniteSwitchPreTrainedModel(GraniteMoeHybridPreTrainedModel):
 
 
 class GraniteSwitchModel(GraniteSwitchPreTrainedModel):
-    """Granite model with switch-controlled LoRA adapters."""
+    """Granite model with switch-controlled LoRA adapters.
+
+    RoPE is only applied when position_embedding_type == "rope".
+    """
 
     def __init__(self, config: GraniteSwitchConfig):
         super().__init__(config)
@@ -439,8 +442,12 @@ class GraniteSwitchModel(GraniteSwitchPreTrainedModel):
         # Final norm
         self.norm = GraniteMoeHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Rotary embeddings (the switch model is always RoPE).
-        self.rotary_emb = GraniteMoeHybridRotaryEmbedding(config=config)
+        # Rotary embeddings (only if position_embedding_type == "rope")
+        self.position_embedding_type = config.position_embedding_type
+        if self.position_embedding_type == "rope":
+            self.rotary_emb = GraniteMoeHybridRotaryEmbedding(config=config)
+        else:
+            self.rotary_emb = None
 
         self.gradient_checkpointing = False
 
@@ -590,7 +597,11 @@ class GraniteSwitchModel(GraniteSwitchPreTrainedModel):
         # Expose adapter_indices for tests and debugging.
         self._last_adapter_indices = adapter_indices
 
-        position_embeddings = self.rotary_emb(inputs_embeds, position_ids=position_ids)
+        position_embeddings = None
+        if self.rotary_emb is not None:
+            position_embeddings = self.rotary_emb(
+                inputs_embeds, position_ids=position_ids
+            )
 
         # Decoder layers.  In a Shadow Residual checkpoint every layer is an
         # SRSwitchDecoderLayer and runs two streams that both start from the

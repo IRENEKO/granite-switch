@@ -405,6 +405,20 @@ class GraniteSwitchModel(nn.Module):
     info=GraniteSwitchASRProcessingInfo,
     dummy_inputs=GraniteSwitchASRDummyInputsBuilder,
 )
+# ``IsHybrid``/``HasInnerState`` are deliberately NOT declared, even though the
+# config's parent is ``GraniteMoeHybridConfig``. Declaring them would make vLLM
+# size the KV cache for ZERO attention layers, because:
+#   1. transformers >=5.16 remaps the bare ``"attention"`` layer type to
+#      ``"full_attention"``, and no longer accepts ``"attention"`` at all, so
+#      ``layer_types`` is ``["full_attention"] * num_hidden_layers`` (config.py).
+#   2. ``ModelConfig.is_hybrid``'s granite-4.0-micro escape hatch compares against
+#      the *literal* ``"attention"``, so it no longer fires for us.
+#   3. ``GraniteMoeHybridConfig.attribute_map`` aliases ``layers_block_type`` to
+#      ``layer_types``, pointing vLLM straight at our all-``full_attention`` list.
+#   4. ``get_num_layers_by_block_type`` then counts ``t == "attention"`` and gets 0.
+# This worked on vLLM 0.19 + transformers 5.9 only because ``layer_types`` was
+# literally ``["attention"]`` back then. The switch model is attention-only with
+# no mamba state, so neither interface has anything to contribute anyway.
 class GraniteSwitchForCausalLM(
     nn.Module,
     SupportsLoRA,

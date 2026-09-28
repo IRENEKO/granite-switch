@@ -220,7 +220,7 @@ def _dense_mlp_to_shared_groups() -> list[ModuleDescriptor]:
     Used for dense Granite models whose base uses ``mlp.gate_proj`` /
     ``mlp.up_proj`` / ``mlp.down_proj`` but whose switch model uses
     ``shared_mlp.input_linear`` / ``shared_mlp.output_linear``
-    (the ``GraniteMoeSharedMLP`` layout).
+    (the ``GraniteMoeHybridMLP`` layout).
     """
     return [
         ModuleDescriptor(
@@ -333,14 +333,11 @@ _MOE_OPTIONAL_FIELDS: dict[str, Any] = {
 
 
 def granite_moe_hybrid_arch(base_config=None) -> ArchDescriptor:
-    """GraniteMoeHybrid architecture (model_type ``granitemoehybrid`` /
-    ``granitemoeshared``).
+    """GraniteMoeHybrid architecture (model_type ``granitemoehybrid``).
 
-    Granite 4 MoE-with-shared-expert models use ``shared_mlp`` module naming
+    GraniteMoeHybrid models use ``shared_mlp`` module naming
     (``shared_input_linear``, ``shared_output_linear``), even dense layers
-    with ``num_local_experts=0``. Real Granite 4.x dense checkpoints are typed
-    ``granitemoehybrid`` upstream (they carry no mamba layers), so this same
-    descriptor serves both model_type strings.
+    with ``num_local_experts=0``.
     """
     optional_fields = dict(_GRANITE_OPTIONAL_FIELDS)
     optional_fields.update(_MOE_OPTIONAL_FIELDS)
@@ -438,12 +435,7 @@ def granite_dense_sr_arch(base_config=None) -> ArchDescriptor:
 _ARCH_REGISTRY = {
     "granite": granite_dense_arch,
     "granitemoe": granite_moe_arch,
-    # Real Granite 4.x dense/MoE-with-shared-expert checkpoints are typed
-    # granitemoehybrid upstream (they carry no mamba layers). A granitemoeshared
-    # key is kept alongside for bases typed that way; both resolve to the same
-    # shared-expert descriptor.
     "granitemoehybrid": granite_moe_hybrid_arch,
-    "granitemoeshared": granite_moe_hybrid_arch,
 }
 
 # Must stay key-for-key in step with _ARCH_REGISTRY: a model_type registered in
@@ -453,7 +445,6 @@ _SR_ARCH_REGISTRY = {
     "granite": granite_dense_sr_arch,
     "granitemoe": granite_moe_sr_arch,
     "granitemoehybrid": granite_moe_hybrid_sr_arch,
-    "granitemoeshared": granite_moe_hybrid_sr_arch,
 }
 
 

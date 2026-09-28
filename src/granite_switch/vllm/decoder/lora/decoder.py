@@ -132,12 +132,15 @@ class GraniteLoRAEmbeddedAttention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # Rotary embeddings (the switch model is always RoPE).
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            max_position=config.max_position_embeddings,
-            rope_parameters=config.rope_parameters,
-        )
+        # Rotary embeddings (only for models with positional encoding)
+        if getattr(config, "position_embedding_type", "rope") == "rope":
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                max_position=config.max_position_embeddings,
+                rope_parameters=config.rope_parameters,
+            )
+        else:
+            self.rotary_emb = None
 
         # Attention layer — head_dim is the native projection_head_dim.
         self.attn = Attention(
@@ -182,7 +185,7 @@ def rms_norm_select(
     """Select between one-arg and two-arg RMSNorm calling conventions.
 
     Different vLLM model classes use different residual-add-norm patterns.
-    Granite/GraniteMoeShared add the residual explicitly then call one-arg
+    Granite/GraniteMoeHybrid add the residual explicitly then call one-arg
     ``norm(x)``.  Llama/Mistral/Qwen2 call two-arg ``norm(x, residual)``
     which fuses the addition into a single CUDA kernel.
 
@@ -255,7 +258,7 @@ class GraniteSwitchDecoderLayer(nn.Module):
     """Attention decoder layer with switch-determined adapter selection.
 
     Covers all three MLP shapes Granite ships: a dense shared MLP alone (4.0/4.1),
-    a frozen expert bank alongside it (4.x MoE), and the expert bank alone
+    a frozen expert bank alongside it (4.x MoE hybrid), and the expert bank alone
     (granitemoe, ``shared_intermediate_size == 0``). The experts are never LoRA
     targets in any of them.
     """
@@ -283,7 +286,7 @@ class GraniteSwitchDecoderLayer(nn.Module):
         # MLP section
         self.has_experts = getattr(config, "num_local_experts", 0) > 0
         if self.has_experts:
-            from vllm.model_executor.models.granitemoe import GraniteMoeMoE
+            from vllm.model_executor.models.granitemoehybrid import GraniteMoeMoE
 
             self.block_sparse_moe = GraniteMoeMoE(
                 num_experts=config.num_local_experts,
@@ -300,13 +303,11 @@ class GraniteSwitchDecoderLayer(nn.Module):
         # self.hidden_size = config.shared_intermediate_size, so building it here
         # would register [0, H] / [H, 0] weights that no checkpoint ships and
         # then add their output to the MoE result. Same gate as upstream vLLM's
-        # own granitemoe model files and as the HF backend
+        # own granitemoehybrid.py and as the HF backend
         # (hf/modeling_granite_switch.py).
         self.has_shared_mlp = getattr(config, "shared_intermediate_size", 0) > 0
         if self.has_shared_mlp:
-            from vllm.model_executor.models.granitemoeshared import (
-                GraniteMoeSharedMLP,
-            )
+            from vllm.model_executor.models.granitemoehybrid import GraniteMoeSharedMLP
 
             self.shared_mlp = GraniteMoeSharedMLP(
                 config=config,

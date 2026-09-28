@@ -489,6 +489,7 @@ class GraniteLoRAEmbeddedAttention(nn.Module):
             key_states = self.k_norm(key_states)
 
         # Apply rotary embeddings (precomputed at model level) when present.
+        # position_embeddings is None when position_embedding_type == "nope".
         cos, sin = (
             position_embeddings if position_embeddings is not None else (None, None)
         )

@@ -285,18 +285,8 @@ class TestArchRegistries:
         assert "granitemoe" in _ARCH_REGISTRY
         assert "granitemoe" in _SR_ARCH_REGISTRY
 
-    def test_granitemoeshared_registered(self):
-        assert "granitemoeshared" in _ARCH_REGISTRY
-        assert "granitemoeshared" in _SR_ARCH_REGISTRY
-
-    def test_granitemoehybrid_key_retained(self):
-        # Real Granite 4.x dense checkpoints are typed granitemoehybrid
-        # upstream; the key must resolve to the shared-expert descriptor.
-        assert "granitemoehybrid" in _ARCH_REGISTRY
-        assert _ARCH_REGISTRY["granitemoehybrid"] is granite_moe_hybrid_arch
-
-    def test_shared_optional_fields_unchanged_by_field_split(self):
-        """Splitting the MoE field bundle must not perturb the shared arch."""
+    def test_hybrid_optional_fields_unchanged_by_field_split(self):
+        """Splitting the MoE field bundle must not perturb the hybrid arch."""
         opt = granite_moe_hybrid_arch().optional_config_fields
         assert opt["shared_intermediate_size"] is None
         assert opt["num_local_experts"] == 0

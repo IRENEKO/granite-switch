@@ -143,7 +143,7 @@ def _audit_loaded(params_dict, loaded_params, model, *, label: str) -> None:
 # segment because vLLM (>=0.26) builds the bank via FusedMoEFactory
 # (``experts.routed_experts.w13_weight``) — verified against both the 0.26 and
 # 0.27 lines. Shared by BOTH adaptations: a composed SR checkpoint is written by
-# the HF SR model, whose layer holds the same GraniteMoeSharedMoE, so the tensor
+# the HF SR model, whose layer holds the same GraniteMoeHybridMoE, so the tensor
 # names and stacked shapes are identical to the LoRA case.
 # --------------------------------------------------------------------------- #
 _MOE_INPUT_SUFFIX = ".block_sparse_moe.experts.gate_up_proj"
