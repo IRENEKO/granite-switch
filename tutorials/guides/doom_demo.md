@@ -154,21 +154,40 @@ of sampling gives 84.5 ± 35.8 frags, top in 11 of 12, so the students sample to
 teacher (20 two-minute games per row, same seeds across rows; "margin" is frags
 ahead of the best bot):
 
-| Condition | Fighter frags/min | Deaths/min | Margin |
-|---|---:|---:|---:|
-| Every tic, no delay (the demo: decisions well under a tic) | 9.09 ± 0.57 | 1.93 | +10.2 |
-| Every tic, 1-tic delay | 6.46 ± 0.49 | 2.26 | +5.2 |
-| Every tic, 3-tic delay (100 ms) | 2.89 ± 0.41 | 2.51 | -3.0 |
-| 10 Hz, no delay | 3.60 ± 0.49 | 2.14 | -1.7 |
-| 10 Hz, 3-tic delay (Jev-like) | 0.33 ± 0.15 | 2.04 | -8.2 |
+| Reactions per second | Reaction time | Fighter frags/min | Deaths/min | Margin |
+|---:|---|---:|---:|---:|
+| 35 (every tic) | under 1 tic (the demo: decisions finish within the tic) | 9.09 ± 0.57 | 1.93 | +10.2 |
+| 35 | 1 tic (29 ms) | 6.46 ± 0.49 | 2.26 | +5.2 |
+| 35 | 3 tics (86 ms) | 2.89 ± 0.41 | 2.51 | -3.0 |
+| 10 | under 1 tic | 3.60 ± 0.49 | 2.14 | -1.7 |
+| 10 | 3 tics (86 ms) | 0.33 ± 0.15 | 2.04 | -8.2 |
 
-One tic of staleness costs this player 29% of its frags. At 10 Hz with 100 ms of
-latency it stops scoring and falls behind the bots. The scripted teacher was
-much less sensitive (in round 0, staleness above a tic halved its kills). One
-reason is that the RL teacher was trained to act every tic with no delay and
-never saw one, so the table overstates what a player trained for 10 Hz would
-lose. It is the right table for this demo: the model imitates exactly this
-player.
+Two numbers describe a player's timing:
+
+- **Reaction time** is how old the state is when the action takes effect.
+- **Reactions per second** is how often a new action is chosen; the last one
+  repeats in between.
+
+In a sequential loop they are one number. A system that needs 100 ms per
+decision gets about 10 reactions per second, each about 3 tics old (the last
+row). Pipelining raises the rate but cannot shorten the reaction (the third
+row). Only a decision faster than a tic reaches the first row.
+
+The Jev post describes about 10 decisions per second but states neither latency
+nor hardware. It sits in the fourth row if its game waits for the model, and in
+the last row if the game runs in real time with a sequential loop.
+
+**Costs for this player:**
+
+- One tic of reaction time costs 29% of its frags.
+- At 10 reactions per second and 86 ms it stops scoring and falls behind the
+  bots.
+
+The scripted teacher was much less sensitive: in round 0, reaction times above a
+tic halved its kills. One reason is that the RL teacher was trained to react
+every tic with fresh state and never saw anything else, so the table overstates
+what a player trained for slower timing would lose. It is the right table for
+this demo, since the model imitates exactly this player.
 
 The styles separate in the intended directions (51M steps, 6 matches each for
 cautious and collector):
@@ -556,21 +575,25 @@ The same teacher under real-time rules: the game never waits, and the last
 action repeats until a newer decision lands. Only the cadence and the age of
 the state each decision uses change.
 
-| Condition | kills/min | damage/min | median reaction |
-|---|---:|---:|---:|
-| Every tic, no delay (this system: 7 ms fits inside a tic) | **16.0** | 215 | **143 ms** |
-| Every tic, 1-tic delay | 13.8 | 206 | 171 ms |
-| Every tic, 3-tic delay (100 ms, pipelined) | 12.0 | 224 | 229 ms |
-| 10 Hz, no delay | 15.2 | 218 | 214 ms |
-| 10 Hz, 3-tic delay | 7.6 | 305 | 357 ms |
+| Reactions per second | Reaction time | kills/min | damage/min | median time to first shot |
+|---:|---|---:|---:|---:|
+| 35 (every tic) | under 1 tic (this system: 7 ms) | **16.0** | 215 | **143 ms** |
+| 35 | 1 tic (29 ms) | 13.8 | 206 | 171 ms |
+| 35 | 3 tics (86 ms, pipelined) | 12.0 | 224 | 229 ms |
+| 10 | under 1 tic | 15.2 | 218 | 214 ms |
+| 10 | 3 tics (86 ms) | 7.6 | 305 | 357 ms |
 
-Reaction is game time from a monster appearing on screen to the first shot at
-it; most of the 143 ms is turning at 7° per tic. Below one tic, faster buys
-headroom (batching, shadow decisions, a bigger model), not faster reflexes,
-because Doom reads input 35 times a second. Above a tic, staleness costs far
-more than a lower cadence. The teacher was designed for every-tic control, so
-the 10 Hz rows are an upper bound on the penalty for a policy designed for
-10 Hz, not a measurement of any other system.
+Time to first shot is game time from a monster appearing on screen to the first
+shot at it; most of the 143 ms is turning at 7° per tic.
+
+- **Below one tic, a faster decision buys headroom, not faster reflexes:** room
+  for batching, shadow decisions or a bigger model. Doom reads input 35 times a
+  second, so the action can't land any sooner.
+- **Above a tic, reaction time costs far more than fewer reactions per second.**
+
+The teacher was designed for every-tic control, so the 10-per-second rows are an
+upper bound on the penalty for a policy designed for that rate, not a
+measurement of any other system.
 
 ### Why aLoRA, honestly
 

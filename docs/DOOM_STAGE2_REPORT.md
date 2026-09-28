@@ -149,9 +149,24 @@ seeds.
 | rl0, 778M-800M (four checkpoints) | 129.3-133.2 | 12.0-15.4 | +104.7 to +110.9 |
 | rl2, 584M (512 wide, mixed conditions) | 112.9 | 14.4 | +88.7 |
 
-- **Reaction speed matters.** For the 51M-step teacher, one tic of staleness
-  costs 29% of its frags, and at 10 Hz with 100 ms of latency it falls behind
-  the bots.
+- **Reaction time and reactions per second both matter, and reaction time more.**
+  The 51M-step teacher, 20 two-minute games per row, same seeds:
+
+  | Reactions per second | Reaction time | Frags/min | Margin per game |
+  |---:|---|---:|---:|
+  | 35 | under 1 tic (this demo) | 9.09 | +10.2 |
+  | 35 | 1 tic (29 ms) | 6.46 | +5.2 |
+  | 35 | 3 tics (86 ms) | 2.89 | -3.0 |
+  | 10 | under 1 tic | 3.60 | -1.7 |
+  | 10 | 3 tics (86 ms) | 0.33 | -8.2 |
+
+  - **In a sequential loop the two are one number:** about 100 ms per decision
+    means about 10 reactions per second, each about 3 tics old.
+  - **Pipelining raises the rate, not the reaction time.** Only a decision faster
+    than a tic reaches the first row.
+  - **The table overstates the loss for a slower player.** This teacher was
+    trained for the first row only; a player trained for slower timing is
+    untested.
 - **Two rule changes were tried and dropped:**
   - The 10 s respawn cut deaths by about a third but did not stop firing at
     nothing.
