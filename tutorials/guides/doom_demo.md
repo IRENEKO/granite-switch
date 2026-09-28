@@ -12,7 +12,10 @@ The code lives in [`tutorials/scripts/doom/`](../scripts/doom/doom_env.py).
 > monsters on `deathmatch.wad`, 12 actions, and the behaviors `hunter`,
 > `survivor` and `scavenger`, measured at commit `9197adc`. The scripts have
 > since moved to stage 2, described in the next section, and the round-0
-> commands no longer reproduce those numbers.
+> commands no longer reproduce those numbers. Stage 2 is current through
+> distillation round f (2026-09-28): a teacher that converged at about 130 frags
+> per ten-minute match, and LoRA, aLoRA and Shadow Residual students trained on
+> the same 2,000 matches.
 
 ## Stage 2 (in progress): deathmatch against built-in bots
 
@@ -176,6 +179,40 @@ cautious and collector):
 | cautious | 84.0 | **14.8** | 18.0 |
 | collector | 84.2 | 17.0 | **21.2** |
 
+**Training longer converges at about 130 frags.** All at 1 s respawn, 12
+ten-minute matches against the default bots, the same seeds for every row
+(steps = updates x 20,480):
+
+| Teacher | Frags | Deaths | Margin |
+|---|---:|---:|---:|
+| rl0, 51M steps (rounds b-d) | 92.8 | 19.2 | +65 |
+| rl0, 163M (round e) | 114.9 | | |
+| **rl0, 706M (round f)** | **130.5 ± 11.4** | **14.8** | **+105.3** |
+| rl0, 778M / 788M / 799M | 129.3 / 133.2 / 133.0 | 15.4 / 12.4 / 12.0 | +104.7 / +109.8 / +110.9 |
+| rl0, 800M (end of run, lr annealed to 0) | 132.2 ± 9.1 | 12.9 | +105.8 |
+| rl2, 584M (512 units wide, trained on mixed conditions) | 112.9 ± 13.6 | 14.4 | +88.7 |
+
+The last five rl0 rows are within noise of each other (standard error about 4
+frags); a 6-match reading of 141.8 at 778M did not hold up over 12 matches.
+rl2 was trained on every bot tier, 3-7 bots and 2-10-minute matches, to
+generalize. On a grid of 5-minute matches (4 tiers x 3 or 7 bots, 6 matches a
+cell), rl0 at 400M steps still had the most frags in every cell; rl2 died least
+in most cells.
+
+**What the teacher does that looks odd.** 27-39% of its shots are fired with no
+bot on screen, and 53% of its shots are the BFG. Under the standard rules firing
+costs nothing: items respawn every 30 s and weapons stay on the floor, so ammo is
+effectively unlimited. Two rule changes were tried and dropped:
+
+- **The competition's 10 s respawn.** The 480M-step teacher scores 91.2 frags
+  under it. Fine-tuned for 60M steps at 10 s (rl3), it ends at about 90 frags
+  with 5.3-6 deaths a match, but fires at nothing more often, not less.
+- **Scarce items** (nothing respawns, weapons do not stay): rl3 collapses to 5.9
+  frags. A fine-tune (rl4) was recovering (16.8 frags, top in 4 of 6 at 15M
+  steps) when it was stopped.
+
+Everything reported uses the standard rules and 1 s respawn.
+
 ### Stage 3: distilling the teacher into Granite (in progress)
 
 The 51M-step teacher plays 40 two-minute matches per style. Every live tic
@@ -228,6 +265,26 @@ choice leads by at least 0.05 (mean total-variation distance 0.005-0.018).
 Overall argmax agreement for the style adapters is 95.9-96.3%. The gap is
 near-ties in flat distributions.
 
+**DAgger rounds c-e.** Each round adds matches the previous student played,
+labeled by the teacher, and fine-tunes from the previous round's adapters. The
+field numbers are fighter students, 8 ten-minute matches against the default
+bots:
+
+| Round | Kind | Training data (matches) | Sampled: frags / margin | Greedy: frags / margin |
+|---|---|---|---:|---:|
+| b0 | aLoRA | 40 two-minute teacher matches per style (51M teacher) | 71.8 / +42.2 | 36.8 / +5.1 |
+| c | aLoRA | + 20 two-minute DAgger matches per style from b0, 40 more two-minute teacher matches per style | 79.6 / +53.2 | 50.2 / +18.6 |
+| d | aLoRA | + 20 two-minute DAgger matches per style from c | 88.4 / +63.4 | 65.4 / +31.5 |
+| d | LoRA | the same, trained from scratch | 95.9 / +68.2 | 74.9 / +48.0 |
+| e | LoRA | 300 ten-minute teacher matches per style (163M teacher), 100 DAgger matches per style from d-LoRA | 100.5 / +76.6 | **114.6 / +90.1** |
+
+- **Greedy decoding catches up with more data.** An imperfect student's argmax
+  loops (b0 greedy scores half its sampled frags); by round e greedy is ahead.
+- **The student's states are not traps.** When the teacher takes over matches
+  the student started, it scores 11.4 frags in the next 90 s, against 12.1 in
+  matches it played from the start. What the student lacks is decisions, not
+  position.
+
 **aLoRA against LoRA and Shadow Residual on the same data.** The probe is a
 history-only question: where, relative to the current heading, was the last
 bot that appears in the history? It is asked only when none is on screen and
@@ -251,9 +308,20 @@ use the full held-out set:
   structural. It is the same property that makes aLoRA cheap (Stage 1): the
   history is pure base-model KV, so every adapter can share it and none can
   reshape it.
-- The SR runs use the same lr 1e-4 and α = rank as the others. That is a
-  quarter of the effective step size of SR's own recipe (lr 2e-4, α = 2r), so
-  the SR numbers are provisional until a learning-rate sweep.
+- **A learning-rate sweep helps aLoRA a little and SR not at all.** Final probe
+  accuracy on the full held-out set (LoRA r32 at lr 1e-4: 0.902):
+
+  | lr, α | 5e-5, 32 | 1e-4, 32 | 1e-4, 64 | 2e-4, 32 | 2e-4, 64 |
+  |---|---:|---:|---:|---:|---:|
+  | aLoRA r32 | 0.626 | 0.686 | 0.690 | **0.730** | 0.722 |
+  | SR r32, cross-stream 32 | 0.613 | 0.628 | 0.632 | 0.619 | 0.633 (wd 0.01, SR's recipe) |
+
+  SR's recipe with cross-stream 96 ends at 0.624. The mid-run evaluations in
+  this sweep used the first 1,000 held-out rows, and the held-out set was not
+  shuffled when nothing had to be dropped, so those rows came from only a few
+  matches. The early peak SR showed on them (step 500 of 1,593) is therefore a
+  weak signal; the study below re-tests it on a shuffled held-out set from 120
+  matches. `train_alora.py` now always shuffles.
 
 Two measurement notes on stage 1. vLLM 0.19.1 fails with "scheduler_metadata must have
 shape (metadata_size)" on steps larger than the largest CUDA-graph capture
@@ -262,6 +330,89 @@ at 2048 fixes it for both variants by chunking such prefills across steps.
 And tail latency depends on the node: two nodes shared with other jobs showed
 p90s near 20 ms for the same single-adapter run that measures 11.6 ms p90 on
 quiet nodes. Both columns above ran on the same quiet node.
+
+#### Round f: one teacher, one dataset, three kinds of adapter
+
+**Data.** The 706M-step teacher plays 2,000 fighter matches and 600 for each
+other style, each with a random bot tier, 3-7 bots and a length of 2-10 minutes.
+Rows are every tenth tic plus every planner tic: 3.78M fighter rows. Another 120
+matches per style, from the same conditions with other seeds, are the held-out
+set every run is scored on.
+
+**Serving Shadow Residual.** The first composed SR student agreed with its PEFT
+adapter on 0-4% of held-out states under vLLM, with NaNs in some slots. The same
+checkpoint under the HF backend matched it (mean total-variation distance 0.017).
+The cause:
+
+- SR's vLLM attention is one layer with twice the model's query heads,
+  `Attention(2 * num_heads, num_kv_heads)`.
+- vLLM 0.19.1 sizes FlashAttention 3's ahead-of-time schedule from the model's
+  head count.
+- So eager steps raise "scheduler_metadata must have shape (metadata_size)", and
+  CUDA-graph steps return wrong logits without an error.
+
+`VLLMPolicy` now selects FlashAttention 2 for dual-stream checkpoints
+(`attention_config={"flash_attn_version": 2}`); the Triton backend also works.
+With it, composed and PEFT agree on every state where the top choice is clear.
+The fighter's mean total-variation distance is 0.010-0.018, and the planner,
+critic and router agree on 99.4-100% of all states. Before this fix, no SR
+number came from a served model; they were all PEFT evaluations.
+
+**Does SR keep learning? A controlled study.** Seven fighter adapters are
+trained under the same conditions:
+
+- one pass over the same 320k rows in the same order, about 160 per match;
+- batch 32, 10,000 steps, cosine schedule, rank 32 unless noted;
+- scored every 500 steps on the same 3,000 held-out rows, as soft cross-entropy
+  against the teacher's distribution.
+
+The teacher's own entropy on those rows, 2.075 nats, is the floor. KL is the
+distance above it.
+
+| Arm (held-out soft CE at step) | 1k | 2k | 4k | 6k | 8k | 10k | KL to teacher | Top-choice agreement |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| LoRA, lr 1e-4 | 2.452 | 2.369 | 2.309 | 2.275 | 2.257 | **2.251** | **0.176** | **0.575** |
+| aLoRA, lr 1e-4 | 2.509 | 2.429 | 2.361 | 2.328 | 2.308 | 2.304 | 0.229 | 0.531 |
+| aLoRA x2 (rank 64) | 2.487 | 2.409 | 2.348 | 2.316 | 2.296 | 2.292 | 0.217 | 0.534 |
+| SR, its own recipe (lr 2e-4, α = 2r, wd 0.01) | 2.493 | 2.403 | 2.338 | 2.307 | 2.296 | 2.296 | 0.221 | 0.534 |
+| SR x2 (rank 64, cross-stream 77), own recipe | 2.491 | 2.409 | 2.345 | 2.308 | 2.294 | 2.293 | 0.218 | 0.534 |
+| SR, lr 1e-4 | 2.493 | 2.421 | 2.364 | 2.340 | 2.334 | 2.333 | 0.258 | 0.495 |
+| SR, lr 5e-5 | 2.552 | 2.456 | 2.396 | 2.375 | 2.369 | 2.369 | 0.294 | 0.468 |
+
+- **With diverse data, SR learns to the end and does not overfit.** Its
+  held-out loss falls until step 9,000 (288k examples). For every run, the loss
+  on each fresh training batch stays within about 0.01 of the held-out loss.
+- **SR's own recipe is its best; a lower learning rate ends worse.**
+- **SR ties aLoRA and trails LoRA by a steady margin.** Both late-invocation
+  kinds land at a KL of 0.22, LoRA at 0.18. The SR-LoRA gap is 0.03-0.045 nats
+  throughout, and SR flattens first: over the last 40% of training it gains
+  0.011 nats, while LoRA and aLoRA gain 0.024.
+- **Doubling capacity does not close the gap.** At twice LoRA's parameters, SR
+  gains 0.003 nats and aLoRA 0.012. (For SR, "x2" means rank 64 with the
+  cross-stream sized to LoRA's parameter count.) At rank 32, a cross-stream of
+  32 is already within 2% of LoRA's parameter count (60.9M vs 62.3M). The k/v
+  LoRA SR cannot have is small under grouped-query attention.
+- **Weapon planners trained on the same rows** agree with the teacher on 92-93%
+  of held-out planner tics for all three kinds: SR 0.922, LoRA 0.931, aLoRA
+  0.928.
+
+**In the field.** The round-f SR student has an SR fighter, planner, critic and
+router; the other styles are copies of the fighter. It played 12 ten-minute
+matches against the default bots:
+
+| Decoding | Frags | Deaths | Margin | Top frag count |
+|---|---:|---:|---:|---:|
+| greedy | 108.2 ± 40.9 | 8.6 | +82.2 | 11 of 12 |
+| sampled (T = 1) | 104.5 ± 9.2 | 12.7 | +81.7 | 12 of 12 |
+
+- **Greedy got stuck in two matches** (26 and 36 frags, with 2 and 0 deaths). In
+  the other ten it averaged 123.6 frags, near the teacher's 130.5.
+- **Sampling never got stuck** (its worst match was 89 frags) but plays less
+  sharply.
+- **The margin is 78% of the teacher's**, just under the stage gate of 80%,
+  before any DAgger round for SR.
+
+The LoRA and aLoRA students trained on the same data are in the field now.
 
 ## What the demo measures, and what it claims
 
@@ -506,6 +657,39 @@ python record_video.py --model models/doom-round0 --out out/granite_doom.mp4 \
   --segment hunter 25 --segment "stop fighting and grab health" 20 \
   --segment "collect all the loot" 20 --segment "go kill everything" 15
 ```
+
+Stage 2, round f (the deathmatch results above):
+
+```bash
+# Teacher: PPO-GRU against the bots (1 GPU learner, ~46 cores of env workers)
+python rl_teacher.py train --out runs/rl0 --device cuda --envs 160 --workers 40 \
+  --eval-workers 6 --eval-matches 6 --eval-every 500 --total-steps 800000000 --lr 2e-4
+python rl_teacher.py eval --ckpt runs/rl0/ckpt_034500.pt --matches 12 --styles fighter \
+  --respawn-s 1 --workers 40 --seed 5000
+T=runs/rl0/ckpt_034500.pt
+
+# Data: randomized matches, sparse rows, and a held-out set from other seeds
+V="--bots all --n-bots-min 3 --n-bots 7 --timeout-min-s 120 --timeout-s 600 --row-every 10"
+python collect.py --policy teacher --teacher $T --behaviors fighter --episodes 2000 --seed 100000 $V --out data/f0/fighter
+python collect.py --policy teacher --teacher $T --behaviors cautious collector --episodes 600 --seed 200000 $V --out data/f0/cc
+python collect.py --policy teacher --teacher $T --episodes 120 --seed 900000 $V --out data/f0h
+
+# One fighter per kind on the same rows; SR with its own recipe
+C="--eval-data data/f0h --every 1 --max-examples 320000 --max-heldout 3000 --eval-n 3000 --batch 32 --keep-best"
+python train_alora.py --adapter fighter --kind lora $C --data data/f0/fighter --base $BASE --out runs/f-lora/fighter
+python train_alora.py --adapter fighter --kind sr --lr 2e-4 --alpha 64 --weight-decay 0.01 --grad-ckpt --micro 8 \
+  $C --data data/f0/fighter --base $BASE --out runs/f-sr/fighter
+# (arms and critic the same way, on data/f0/fighter data/f0/cc; the router on data/router)
+
+# Compose (the composer reads SR from the weights), check parity, play
+python build_model.py compose --kind sr --runs runs/f-sr --router-runs runs/router-sr --base $BASE --out models/doom-f-sr
+python build_model.py verify --runs runs/f-sr --router-runs runs/router-sr --model models/doom-f-sr
+python collect.py --policy vllm --model models/doom-f-sr --teacher expert --behaviors fighter \
+  --episodes 12 --timeout-s 600 --stats-only --out out/field_f-sr
+```
+
+Under DDP, prefix `train_alora.py` with `python -m torch.distributed.run --standalone
+--nproc_per_node N`; each rank takes a slice of every batch.
 
 From a laptop, tunnel to the GPU host: `ssh -L 8000:<gpu-node>:8000 <login-node>`.
 

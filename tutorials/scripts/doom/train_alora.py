@@ -333,8 +333,9 @@ def main() -> None:
     rng = random.Random(args.seed)
     if len(train_rows) > args.max_examples:
         train_rows = rng.sample(train_rows, args.max_examples)
-    if len(val_rows) > args.max_heldout:
-        val_rows = rng.sample(val_rows, args.max_heldout)
+    # Random order even when nothing is dropped: rows arrive grouped by match, so
+    # the mid-run slice (--eval-n) would otherwise cover only the first few matches.
+    val_rows = rng.sample(val_rows, min(len(val_rows), args.max_heldout))
 
     def prompt(r) -> list[int]:
         stream, n, state = r[0], r[1], r[2]
