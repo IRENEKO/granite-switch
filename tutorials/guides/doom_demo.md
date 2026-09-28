@@ -396,23 +396,51 @@ distance above it.
   of held-out planner tics for all three kinds: SR 0.922, LoRA 0.931, aLoRA
   0.928.
 
-**In the field.** The round-f SR student has an SR fighter, planner, critic and
-router; the other styles are copies of the fighter. It played 12 ten-minute
-matches against the default bots:
+**In the field.** Each round-f student combines that kind's fighter and its
+planner (the same recipe and rows for all three) with a router. The SR student
+also has a new SR critic; the LoRA and aLoRA students reuse critics from rounds
+e and d, which only feed the UI. The other styles are copies of the fighter.
+Each student played 12 ten-minute matches against the default bots, the same
+seeds for all:
 
-| Decoding | Frags | Deaths | Margin | Top frag count |
+| Student | Greedy: frags / deaths / margin | Top | Sampled (T = 1): frags / deaths / margin | Top | Sampled margin / teacher's |
+|---|---:|---:|---:|---:|---:|
+| **LoRA** | 115.9 ± 28.7 / 7.6 / +92.6 | 12 of 12 | **120.3 ± 13.1 / 14.8 / +96.1** | 12 of 12 | **91%** |
+| SR | 108.2 ± 40.9 / 8.6 / +82.2 | 11 of 12 | 104.5 ± 9.2 / 12.7 / +81.7 | 12 of 12 | 78% |
+| aLoRA | 82.2 ± 50.6 / 4.9 / +55.7 | 9 of 12 | 104.3 ± 8.7 / 15.7 / +80.2 | 12 of 12 | 76% |
+| teacher (706M) | | | 130.5 ± 11.4 / 14.8 / +105.3 | 12 of 12 | |
+
+- **The LoRA student passes the stage gate** (80% of the teacher's margin): it
+  reaches 91%, with every sampled match at 105 frags or more.
+- **SR and aLoRA tie when sampling**, just under the gate, before any DAgger
+  round on the round-f data.
+- **Greedy decoding gets the late-invocation students stuck.** The SR student
+  stalled in two matches (26 and 36 frags); in the other ten it averaged 123.6.
+  The aLoRA student stalled in four (0, 21, 25 and 41). The LoRA student had one
+  weak match (45). Sampling never stalled.
+- **The aLoRA-SR comparison is not recipe-matched.** The SR fighter used SR's
+  own recipe (lr 2e-4, α = 2r, wd 0.01), about four times the effective step of
+  aLoRA's (lr 1e-4, α = r). On the probe, aLoRA gains from lr 2e-4, and at
+  aLoRA's settings SR does worse than aLoRA on held-out (KL 0.258 against
+  0.229). The tie is therefore best read as aLoRA at least matching SR.
+
+**The item rules decide whether play has phases.** The 706M teacher, 12 matches
+per rule set ("weak" means no usable weapon above the pistol):
+
+| Rules | Frags | Time weak | Frags/min armed | Frags/min weak |
 |---|---:|---:|---:|---:|
-| greedy | 108.2 ± 40.9 | 8.6 | +82.2 | 11 of 12 |
-| sampled (T = 1) | 104.5 ± 9.2 | 12.7 | +81.7 | 12 of 12 |
+| standard | 130.5 | 8.1% | 14.1 | 2.0 |
+| scarce | 5.8 | 83.9% | 3.8 | 0.03 |
 
-- **Greedy got stuck in two matches** (26 and 36 frags, with 2 and 0 deaths). In
-  the other ten it averaged 123.6 frags, near the teacher's 130.5.
-- **Sampling never got stuck** (its worst match was 89 frags) but plays less
-  sharply.
-- **The margin is 78% of the teacher's**, just under the stage gate of 80%,
-  before any DAgger round for SR.
-
-The LoRA and aLoRA students trained on the same data are in the field now.
+Armed, the teacher scores seven times faster than weak, but under the standard
+rules it is weak only briefly, because weapons stay on the floor. Under scarce
+rules, trained where ammo is plentiful, it never learns to forage. Doom's
+"classic" (altdeath) rules, where items respawn but weapons do not stay, crash
+ViZDoom 1.3.1 within about 1.4 s in every match. The crash is in its objects-info
+buffer: with that buffer off the same matches run, and every other rule set runs
+with it on. The trigger is a picked-up weapon being hidden until it respawns,
+which only classic does. Freedoom's DEHACKED patch is not involved; it touches no
+Things, only seven frames and text.
 
 ## What the demo measures, and what it claims
 
