@@ -54,13 +54,17 @@ class GraniteSwitchConfig(GraniteMoeHybridConfig):
             asr_enabled (bool): Register the audio preprocessor that transcribes
                 audio and splices the transcript into the prompt. Default: False.
             asr_model_id (Optional[str]): HF id of the speech-to-text model. None
-                falls back to a small built-in default.
-            asr_device (str): Device the ASR model runs on. Default "cpu" keeps
-                vLLM's GPU KV-cache budget clean.
+                falls back to the built-in default (Granite Speech 5.0 TurboCTC,
+                a 470M English CTC encoder).
+            asr_device (str): Device the ASR model runs on. Default "cuda" — the
+                default encoder is small and GPU-bound work is what makes it fast.
+                Set "cpu" to keep vLLM's GPU memory budget entirely for KV cache.
             asr_dtype (Optional[str]): Precision the ASR weights load in, one of
-                ASR_DTYPES. None/"auto" derives it from asr_device (float16 on
-                CUDA). An encoder with BatchNorm layers must set "float32".
-                Default: None.
+                ASR_DTYPES. None/"auto" derives it from asr_device (bfloat16 on
+                CUDA, float32 otherwise). bfloat16 because it is the default
+                checkpoint's own dtype and keeps float32's exponent range, which
+                suits an encoder with BatchNorm layers; float16 still works on the
+                default model and can be set explicitly. Default: None.
             asr_pipeline_kwargs (Optional[dict]): Extra kwargs merged into the
                 ``transformers.pipeline(...)`` construction, e.g.
                 ``{"chunk_length_s": 15}``. Baked into the transcriber cache key.
@@ -73,15 +77,21 @@ class GraniteSwitchConfig(GraniteMoeHybridConfig):
                 synchronous transcriptions one request can trigger and the startup
                 profiling pass; ``--limit-mm-per-prompt`` may lower it, not raise
                 it. Default: 32.
-            asr_chunk_length_s (float): Chunker window length in seconds. Only
-                used when asr_self_chunks is False. Default: 30.0.
+            asr_chunk_length_s (float): Chunker window length in seconds, and so
+                also the longest clip that reaches the backend in one piece (a
+                shorter clip is a single segment). Only used when asr_self_chunks
+                is False. Default: 120.0 — what the default CTC encoder handles in
+                one pass before activation memory dominates.
             asr_chunk_overlap_s (float): Overlap in seconds between chunker
                 windows, de-duplicated by the transcript merge. Only used when
                 asr_self_chunks is False. Default: 5.0.
             asr_self_chunks (bool): True when the backend chunks long audio
                 itself (Whisper's timestamp stitching beats our text-level merge),
                 bypassing our chunker. False routes audio through the
-                split/transcribe/merge chunker instead. Default: True.
+                split/transcribe/merge chunker instead. Default: False — the
+                default CTC backend does not self-chunk, and the HF pipeline's own
+                CTC chunking mis-trims seams for it (it needs the model to publish
+                inputs_to_logits_ratio, which this checkpoint does not).
 
         Shadow Residual (SR) parameters:
             dual_stream (bool): Whole-checkpoint decoder mode. ``False`` (default) =
@@ -161,14 +171,14 @@ class GraniteSwitchConfig(GraniteMoeHybridConfig):
         # Audio (ASR) preprocessing parameters
         asr_enabled: bool = False,
         asr_model_id: str | None = None,
-        asr_device: str = "cpu",
+        asr_device: str = "cuda",
         asr_dtype: str | None = None,
         asr_pipeline_kwargs: dict | None = None,
         asr_generate_kwargs: dict | None = None,
         asr_max_audio_clips: int = 32,
-        asr_chunk_length_s: float = 30.0,
+        asr_chunk_length_s: float = 120.0,
         asr_chunk_overlap_s: float = 5.0,
-        asr_self_chunks: bool = True,
+        asr_self_chunks: bool = False,
         # Shadow Residual (SR) parameters
         cross_stream_rank: int | None = None,
         dual_stream: bool = False,
@@ -184,13 +194,19 @@ class GraniteSwitchConfig(GraniteMoeHybridConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
-        # Compute default layer_types before parent init.
-        # layer_types must have length == num_hidden_layers (includes switch layer at
-        # index 0 when adapters are present). This ensures DynamicCache pre-allocation
-        # matches the global layer indices used by decoder layers.
+        # The switch model is attention-only with RoPE, but its parent
+        # ``GraniteMoeHybridConfig`` is a mamba/attention hybrid whose
+        # ``__post_init__`` fills an *unset* ``layer_types`` with
+        # ``["linear_attention"] * num_hidden_layers`` — i.e. all mamba, which
+        # would make ``DynamicCache`` allocate the wrong per-layer cache. So the
+        # switch config must pin ``layer_types`` to all-attention itself. The
+        # length must equal ``num_hidden_layers`` (already inflated by the
+        # composer's cache slots, which are attention too) or the parent's
+        # ``validate_layer_type`` length check rejects the config. ``"attention"``
+        # is remapped to the canonical ``"full_attention"`` by transformers 5.16.
         if layer_types is None:
             num_hidden_layers = kwargs.get("num_hidden_layers", 32)
-            layer_types = ["attention"] * num_hidden_layers
+            layer_types = ["full_attention"] * num_hidden_layers
 
         super().__init__(
             num_local_experts=num_local_experts,
@@ -199,13 +215,19 @@ class GraniteSwitchConfig(GraniteMoeHybridConfig):
             **kwargs,
         )
 
-        # Default shared_intermediate_size from intermediate_size.  Granite 4
-        # models all have a shared_mlp; for dense ones its width equals
-        # intermediate_size.  The test MUST stay ``is None``: 0 is the explicit
-        # "no shared MLP" encoding used by pure sparse MoE bases (granitemoe),
-        # and a falsy test would silently resurrect the module.
-        if self.shared_intermediate_size is None:
-            self.shared_intermediate_size = self.intermediate_size
+        # Resolve shared_intermediate_size independently of the parent default.
+        # The GraniteMoeHybrid parent defaults it to a fixed 1024, which is the
+        # wrong width for dense bases and does not encode the "no shared MLP"
+        # sentinel (0) that pure sparse-MoE bases (granitemoe) rely on.  So the
+        # switch config must decide it itself rather than inherit a magic default:
+        # an explicitly-supplied value (including 0) is honored verbatim; only when
+        # it is left unset do we resolve it — dense (no experts) gets a shared MLP
+        # sized to intermediate_size, pure MoE keeps the 0 sentinel.  This is a
+        # compose-time decision that is then frozen into config.json.
+        if kwargs.get("shared_intermediate_size") is None:
+            self.shared_intermediate_size = (
+                0 if num_local_experts > 0 else self.intermediate_size
+            )
 
         # Validate num_adapters
         if num_adapters < 0:
@@ -490,14 +512,14 @@ class GraniteSwitchConfig(GraniteMoeHybridConfig):
             lora_target_modules = []
 
             if self.num_adapters > 0:
-                # Attention modules (present in all attention layers)
-                if any(lt == "attention" for lt in self.layer_types):
-                    lora_target_modules.extend(
-                        [
-                            "qkv_proj",  # Q/K/V fused
-                            "o_proj",  # O projection
-                        ]
-                    )
+                # Attention modules: the switch model is attention-only, so
+                # every layer has them.
+                lora_target_modules.extend(
+                    [
+                        "qkv_proj",  # Q/K/V fused
+                        "o_proj",  # O projection
+                    ]
+                )
 
                 # MLP modules: only where a shared_mlp exists to hold them.
                 # Pure sparse MoE bases have none, and asking for the groups
